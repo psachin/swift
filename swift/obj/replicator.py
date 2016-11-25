@@ -618,8 +618,11 @@ class ObjectReplicator(Daemon):
                 part_nodes = None
                 try:
                     job_path = join(obj_path, partition)
-                    part_nodes = policy.object_ring.get_part_nodes(
-                        int(partition))
+                    part = int(partition)
+                    if not 0 <= part < policy.object_ring.partition_count:
+                        part_nodes = []
+                    else:
+                        part_nodes = policy.object_ring.get_part_nodes(part)
                     nodes = [node for node in part_nodes
                              if node['id'] != local_dev['id']]
                     jobs.append(

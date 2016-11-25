@@ -371,6 +371,24 @@ class TestRing(TestRingBase):
         part, nodes = self.ring.get_nodes('a')
         self.assertEqual(nodes, self.ring.get_part_nodes(part))
 
+        part, nodes = self.ring.get_nodes('a', 'c')
+        self.assertEqual(nodes, self.ring.get_part_nodes(part))
+
+        part, nodes = self.ring.get_nodes('a', 'c', 'o0')
+        self.assertEqual(nodes, self.ring.get_part_nodes(part))
+
+        # Test: part >= 0
+        with self.assertRaises(ValueError):
+            self.ring.get_part_nodes(-1)
+
+        # Test: part < partition_count
+        with self.assertRaises(ValueError):
+            self.ring.get_part_nodes(self.ring.partition_count)
+
+        # Test large part number
+        with self.assertRaises(ValueError):
+            self.ring.get_part_nodes(2 ** 32)
+
     def test_get_nodes(self):
         # Yes, these tests are deliberately very fragile. We want to make sure
         # that if someones changes the results the ring produces, they know it.

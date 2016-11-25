@@ -736,7 +736,10 @@ class ObjectReconstructor(Daemon):
         jobs = []
 
         # check the primary nodes - to see if the part belongs here
-        part_nodes = policy.object_ring.get_part_nodes(partition)
+        try:
+            part_nodes = policy.object_ring.get_part_nodes(partition)
+        except ValueError:
+            part_nodes = []
         for node in part_nodes:
             if node['id'] == local_dev['id']:
                 # this partition belongs here, we'll need a sync job

@@ -281,6 +281,11 @@ class Ring(object):
         return getmtime(self.serialized_path) != self._mtime
 
     def _get_part_nodes(self, part):
+        # part >= 0 or part < partition_count
+        if not 0 <= part < self.partition_count:
+            raise ValueError(
+                'Invalid partition %s (valid range is 0 to %d)' %
+                (part, self.partition_count - 1))
         part_nodes = []
         seen_ids = set()
         for r2p2d in self._replica2part2dev_id:
