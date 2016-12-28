@@ -17,6 +17,8 @@ import unittest
 
 from test.unit.proxy import test_server
 from test.unit.proxy.test_server import teardown
+from test.unit.proxy.controllers import test_account
+from test.unit.proxy.controllers import test_container
 
 from swift.obj import mem_server
 
@@ -55,16 +57,16 @@ class TestObjectController(test_server.TestObjectController):
         pass
 
 
-class TestContainerController(test_server.TestContainerController):
+class TestContainerController(test_container.TestContainerController):
     pass
 
 
-class TestAccountController(test_server.TestAccountController):
+class TestAccountController(test_account.TestAccountController):
     pass
 
 
 class TestAccountControllerFakeGetResponse(
-        test_server.TestAccountControllerFakeGetResponse):
+        test_account.TestAccountControllerFakeGetResponse):
     pass
 
 

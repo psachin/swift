@@ -29,8 +29,8 @@ from swift.common.storage_policy import POLICIES
 from swift.common.swob import Request, HTTPException
 from test.unit import patch_policies, debug_logger, FakeMemcache, FakeRing
 from test.unit.common.middleware.helpers import FakeSwift
-from test.unit.proxy.controllers.test_obj import set_http_connect, \
-    PatchedObjControllerApp
+from test.unit.proxy.controllers.test_obj import (
+    set_http_connect_contextmgr, PatchedObjControllerApp)
 
 
 class TestCopyConstraints(unittest.TestCase):
@@ -1570,9 +1570,10 @@ class TestServerSideCopyMiddlewareWithEC(unittest.TestCase):
             if method == 'PUT':
                 put_hdrs.append(args[0])
 
-        with set_http_connect(*status_codes, body_iter=body_iter,
-                              headers=headers, expect_headers=expect_headers,
-                              give_connect=capture_conn):
+        with set_http_connect_contextmgr(
+                *status_codes, body_iter=body_iter,
+                headers=headers, expect_headers=expect_headers,
+                give_connect=capture_conn):
             resp = req.get_response(self.ssc)
 
         self.assertEqual(resp.status_int, 201)
@@ -1627,8 +1628,9 @@ class TestServerSideCopyMiddlewareWithEC(unittest.TestCase):
             'X-Obj-Multiphase-Commit': 'yes'
         }
         # TODO possibly use FakeApp here
-        with set_http_connect(*status_codes, body_iter=body_iter,
-                              headers=headers, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(
+                *status_codes, body_iter=body_iter,
+                headers=headers, expect_headers=expect_headers):
             resp = req.get_response(self.ssc)
         self.assertEqual(resp.status_int, 416)
         self.assertEqual(resp.content_length, len(range_not_satisfiable_body))

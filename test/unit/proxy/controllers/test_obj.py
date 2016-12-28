@@ -17,8 +17,10 @@
 import email.parser
 import itertools
 import math
+import os
 import random
 import time
+from tempfile import mkdtemp
 import unittest
 from collections import defaultdict
 from contextlib import contextmanager
@@ -26,26 +28,54 @@ import json
 from hashlib import md5
 
 import mock
-from eventlet import Timeout
+from eventlet import Timeout, sleep
 from six import BytesIO
 from six.moves import range
+from shutil import rmtree
 
 import swift
-from swift.common import utils, swob, exceptions
-from swift.common.exceptions import ChunkWriteTimeout
+from swift.common import constraints, exceptions, swob, utils
+from swift.common.exceptions import ChunkReadTimeout, ChunkWriteTimeout
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.utils import Timestamp
-from swift.obj import server
+from swift.obj import server as object_server
 from swift.proxy import server as proxy_server
-from swift.proxy.controllers import obj
+from swift.proxy.controllers.obj import (
+    ECObjectController, ReplicatedObjectController)
 from swift.proxy.controllers.base import \
-    get_container_info as _real_get_container_info
+    get_container_info as _real_get_container_info, cors_validation
 from swift.common.storage_policy import POLICIES, ECDriverError, StoragePolicy
+from swift.common.swob import (
+    Request, Response, HTTPUnauthorized, HTTPException)
 
-from test.unit import FakeRing, FakeMemcache, fake_http_connect, \
-    debug_logger, patch_policies, SlowBody, FakeStatus, \
-    encode_frag_archive_bodies
-from test.unit.proxy.test_server import node_error_count
+from test.unit import (
+    FakeLogger, FakeRing, FakeMemcache,
+    fake_http_connect, debug_logger, patch_policies, SlowBody,
+    FakeStatus, encode_frag_archive_bodies, mocked_http_conn)
+from test.unit.proxy.test_server import (
+    node_error_count, node_last_error, set_node_errors)
+from test.unit.proxy import (
+    save_globals, set_http_connect, FakeMemcacheReturnsNone)
+
+from test.unit.helpers import setup_servers
+
+
+STATIC_TIME = time.time()
+_test_context = _test_servers = None
+
+
+def do_setup(object_server):
+    """
+    Duplicated in proxy/test_server.py
+    Can this be refactered?
+    """
+    global _test_context, _test_servers
+    _test_context = setup_servers(object_server)
+    _test_servers = _test_context["test_servers"]
+
+
+def setup():
+    do_setup(object_server)
 
 
 def unchunk_body(chunked_body):
@@ -60,7 +90,7 @@ def unchunk_body(chunked_body):
 
 
 @contextmanager
-def set_http_connect(*args, **kwargs):
+def set_http_connect_contextmgr(*args, **kwargs):
     old_connect = swift.proxy.controllers.base.http_connect
     new_connect = fake_http_connect(*args, **kwargs)
     try:
@@ -281,7 +311,7 @@ class BaseObjectControllerMixin(object):
             self.app, 'a', 'c', 'o')
         req = swift.common.swob.Request.blank('/v1/a/c/o')
         self.app.conn_timeout = 0.05
-        with set_http_connect(slow_connect=True):
+        with set_http_connect_contextmgr(slow_connect=True):
             nodes = [dict(ip='', port='', device='')]
             res = controller._connect_put_node(nodes, '', req, {}, ('', ''))
         self.assertIsNone(res)
@@ -289,7 +319,7 @@ class BaseObjectControllerMixin(object):
     def test_DELETE_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
         codes = [204] * self.replicas()
-        with set_http_connect(*codes):
+        with set_http_connect_contextmgr(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
 
@@ -301,7 +331,7 @@ class BaseObjectControllerMixin(object):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
         codes = [404] + [204] * (self.replicas() - 1)
         random.shuffle(codes)
-        with set_http_connect(*codes):
+        with set_http_connect_contextmgr(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
 
@@ -312,7 +342,7 @@ class BaseObjectControllerMixin(object):
             return
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
         codes = [404] * (self.replicas() - 1) + [204]
-        with set_http_connect(*codes):
+        with set_http_connect_contextmgr(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 404)
 
@@ -321,7 +351,7 @@ class BaseObjectControllerMixin(object):
         mostly_204s = [204] * self.quorum()
         codes = mostly_204s + [404] * (self.replicas() - len(mostly_204s))
         self.assertEqual(len(codes), self.replicas())
-        with set_http_connect(*codes):
+        with set_http_connect_contextmgr(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
 
@@ -330,7 +360,7 @@ class BaseObjectControllerMixin(object):
         mostly_404s = [404] * self.quorum()
         codes = mostly_404s + [204] * (self.replicas() - len(mostly_404s))
         self.assertEqual(len(codes), self.replicas())
-        with set_http_connect(*codes):
+        with set_http_connect_contextmgr(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 404)
 
@@ -338,7 +368,7 @@ class BaseObjectControllerMixin(object):
         self.obj_ring.set_replicas(4)
 
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
-        with set_http_connect(404, 204, 404, 204):
+        with set_http_connect_contextmgr(404, 204, 404, 204):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
 
@@ -352,8 +382,8 @@ class BaseObjectControllerMixin(object):
         headers = [{}, {}, {'Pick-Me': 'yes'}, {'Pick-Me': 'yes'}]
 
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
-        with set_http_connect(*status_codes, body_iter=bodies,
-                              headers=headers):
+        with set_http_connect_contextmgr(*status_codes, body_iter=bodies,
+                                         headers=headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
         self.assertEqual(resp.headers.get('Pick-Me'), 'yes')
@@ -362,7 +392,7 @@ class BaseObjectControllerMixin(object):
     def test_DELETE_handoff(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
         codes = [204] * self.replicas()
-        with set_http_connect(507, *codes):
+        with set_http_connect_contextmgr(507, *codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
 
@@ -380,7 +410,7 @@ class BaseObjectControllerMixin(object):
         req = swob.Request.blank('/v1/a/c/o', method='PUT', body='',
                                  headers={'Content-Type': 'foo/bar',
                                           'X-Delete-After': t})
-        with set_http_connect():
+        with set_http_connect_contextmgr():
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 400)
         self.assertEqual('Non-integer X-Delete-After', resp.body)
@@ -397,7 +427,7 @@ class BaseObjectControllerMixin(object):
         req = swob.Request.blank('/v1/a/c/o', method='PUT', body='',
                                  headers={'Content-Type': 'foo/bar',
                                           'X-Delete-After': '-60'})
-        with set_http_connect():
+        with set_http_connect_contextmgr():
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 400)
         self.assertEqual('X-Delete-After in past', resp.body)
@@ -416,7 +446,7 @@ class BaseObjectControllerMixin(object):
         req = swob.Request.blank('/v1/a/c/o', method='PUT', body='',
                                  headers={'Content-Type': 'foo/bar',
                                           'X-Delete-At': t})
-        with set_http_connect():
+        with set_http_connect_contextmgr():
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 400)
         self.assertEqual('Non-integer X-Delete-At', resp.body)
@@ -435,14 +465,14 @@ class BaseObjectControllerMixin(object):
         req = swob.Request.blank('/v1/a/c/o', method='PUT', body='',
                                  headers={'Content-Type': 'foo/bar',
                                           'X-Delete-At': t})
-        with set_http_connect():
+        with set_http_connect_contextmgr():
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 400)
         self.assertEqual('X-Delete-At in past', resp.body)
 
     def test_HEAD_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='HEAD')
-        with set_http_connect(200):
+        with set_http_connect_contextmgr(200):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertIn('Accept-Ranges', resp.headers)
@@ -450,7 +480,7 @@ class BaseObjectControllerMixin(object):
     def test_HEAD_x_newest(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='HEAD',
                                               headers={'X-Newest': 'true'})
-        with set_http_connect(*([200] * self.replicas())):
+        with set_http_connect_contextmgr(*([200] * self.replicas())):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
 
@@ -465,8 +495,8 @@ class BaseObjectControllerMixin(object):
             'X-Backend-Timestamp': t.internal,
             'X-Timestamp': t.normal
         } for t in timestamps]
-        with set_http_connect(*([200] * self.replicas()),
-                              headers=backend_response_headers):
+        with set_http_connect_contextmgr(*([200] * self.replicas()),
+                                         headers=backend_response_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['x-timestamp'], newest_timestamp.normal)
@@ -483,8 +513,8 @@ class BaseObjectControllerMixin(object):
             'X-Backend-Timestamp': t.internal,
             'X-Timestamp': t.normal
         } for t in timestamps]
-        with set_http_connect(*([200] * self.replicas()),
-                              headers=backend_response_headers):
+        with set_http_connect_contextmgr(*([200] * self.replicas()),
+                                         headers=backend_response_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['x-backend-timestamp'],
@@ -514,9 +544,9 @@ class BaseObjectControllerMixin(object):
                 'headers': headers,
             }
             request_log.append(req)
-        with set_http_connect(*responses,
-                              headers=backend_response_headers,
-                              give_connect=capture_requests):
+        with set_http_connect_contextmgr(*responses,
+                                         headers=backend_response_headers,
+                                         give_connect=capture_requests):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         for req in request_log:
@@ -532,7 +562,7 @@ class BaseObjectControllerMixin(object):
                     'X-Timestamp': next(ts).internal})
             codes = [409] * self.obj_ring.replicas
             ts_iter = itertools.repeat(next(ts).internal)
-            with set_http_connect(*codes, timestamps=ts_iter):
+            with set_http_connect_contextmgr(*codes, timestamps=ts_iter):
                 resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 409)
 
@@ -582,12 +612,12 @@ class BaseObjectControllerMixin(object):
 class TestReplicatedObjController(BaseObjectControllerMixin,
                                   unittest.TestCase):
 
-    controller_cls = obj.ReplicatedObjectController
+    controller_cls = ReplicatedObjectController
 
     def test_PUT_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT')
         req.headers['content-length'] = '0'
-        with set_http_connect(201, 201, 201):
+        with set_http_connect_contextmgr(201, 201, 201):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 201)
 
@@ -602,7 +632,8 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
             'X-Obj-Metadata-Footer': 'yes'
         }
 
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 503)
 
@@ -634,10 +665,12 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
             'Some-Header': 'Four',
             'Etag': '"%s"' % etag,
         }
-        with set_http_connect(*codes, expect_headers=expect_headers,
-                              give_send=capture_body,
-                              give_connect=capture_headers,
-                              headers=resp_headers):
+        with set_http_connect_contextmgr(
+                *codes,
+                expect_headers=expect_headers,
+                give_send=capture_body,
+                give_connect=capture_headers,
+                headers=resp_headers):
             resp = req.get_response(self.app)
 
         self.assertEqual(resp.status_int, 201)
@@ -714,10 +747,12 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
             # NB: ignored!
             'Some-Header': 'Four',
         }
-        with set_http_connect(*codes, expect_headers=expect_headers,
-                              give_send=capture_body,
-                              give_connect=capture_headers,
-                              headers=resp_headers):
+        with set_http_connect_contextmgr(
+                *codes,
+                expect_headers=expect_headers,
+                give_send=capture_body,
+                give_connect=capture_headers,
+                headers=resp_headers):
             resp = req.get_response(self.app)
 
         self.assertEqual(resp.status_int, 201)
@@ -788,8 +823,8 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
         # we capture stdout since the debug log formatter prints the formatted
         # message to stdout
         stdout = BytesIO()
-        with set_http_connect((100, Timeout()), 503, 503), \
-                mock.patch('sys.stdout', stdout):
+        with set_http_connect_contextmgr(
+                (100, Timeout()), 503, 503), mock.patch('sys.stdout', stdout):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 503)
         for line in stdout.getvalue().splitlines():
@@ -813,7 +848,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
         codes = [FakeStatus((422, 200))
                  for _junk in range(self.replicas())]
 
-        with set_http_connect(*codes):
+        with set_http_connect_contextmgr(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 422)
 
@@ -821,7 +856,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT')
         req.headers['if-none-match'] = '*'
         req.headers['content-length'] = '0'
-        with set_http_connect(201, 201, 201):
+        with set_http_connect_contextmgr(201, 201, 201):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 201)
 
@@ -829,7 +864,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT')
         req.headers['if-none-match'] = '*'
         req.headers['content-length'] = '0'
-        with set_http_connect(201, 412, 201):
+        with set_http_connect_contextmgr(201, 412, 201):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 412)
 
@@ -837,7 +872,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT')
         req.headers['if-none-match'] = 'somethingelse'
         req.headers['content-length'] = '0'
-        with set_http_connect():
+        with set_http_connect_contextmgr():
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 400)
 
@@ -849,7 +884,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
             self.app._error_limiting = {}
             req = swob.Request.blank('/v1/a/c/o.jpg', method='PUT',
                                      body='test body')
-            with set_http_connect(*statuses):
+            with set_http_connect_contextmgr(*statuses):
                 resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, expected)
 
@@ -904,7 +939,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
                                  method='PUT',
                                  body='life is utf-gr8')
         self.app.logger.clear()
-        with set_http_connect(*statuses):
+        with set_http_connect_contextmgr(*statuses):
             resp = req.get_response(self.app)
 
         self.assertEqual(resp.status_int, expected)
@@ -920,7 +955,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
                                      method='PUT',
                                      body='life is utf-gr8')
             self.app.logger.clear()
-            with set_http_connect(*statuses):
+            with set_http_connect_contextmgr(*statuses):
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 201)
@@ -948,7 +983,8 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
                                      method='PUT',
                                      body='life is utf-gr8')
             self.app.logger.clear()
-            with set_http_connect(201, 201, 201, give_send=capture_send):
+            with set_http_connect_contextmgr(201, 201, 201,
+                                             give_send=capture_send):
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 201)
@@ -967,7 +1003,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
                                      method='PUT',
                                      body='life is utf-gr8')
             self.app.logger.clear()
-            with set_http_connect(*statuses):
+            with set_http_connect_contextmgr(*statuses):
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 201)
@@ -1000,7 +1036,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
                                      method='DELETE',
                                      body='life is utf-gr8')
             self.app.logger.clear()
-            with set_http_connect(*statuses):
+            with set_http_connect_contextmgr(*statuses):
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 201)
@@ -1050,7 +1086,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
 
         req.environ['wsgi.input'] = FakeReader()
         req.headers['content-length'] = '6'
-        with set_http_connect(201, 201, 201):
+        with set_http_connect_contextmgr(201, 201, 201):
             resp = req.get_response(self.app)
 
         self.assertEqual(resp.status_int, 499)
@@ -1065,7 +1101,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
 
         req.environ['wsgi.input'] = FakeReader()
         req.headers['content-length'] = '6'
-        with set_http_connect(201, 201, 201):
+        with set_http_connect_contextmgr(201, 201, 201):
             resp = req.get_response(self.app)
 
         self.assertEqual(resp.status_int, 408)
@@ -1085,7 +1121,8 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
 
         req.environ['wsgi.input'] = FakeReader()
         req.headers['content-length'] = '6'
-        with set_http_connect(201, 201, 201, give_expect=capture_expect):
+        with set_http_connect_contextmgr(201, 201, 201,
+                                         give_expect=capture_expect):
             resp = req.get_response(self.app)
 
         self.assertEqual(resp.status_int, 499)
@@ -1103,29 +1140,32 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
 
         req.environ['wsgi.input'] = FakeReader()
         req.headers['content-length'] = '6'
-        with set_http_connect(201, 201, 201):
+        with set_http_connect_contextmgr(201, 201, 201):
             resp = req.get_response(self.app)
 
         self.assertEqual(resp.status_int, 500)
 
     def test_GET_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
-        with set_http_connect(200):
+        with set_http_connect_contextmgr(200):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertIn('Accept-Ranges', resp.headers)
 
     def test_GET_transfer_encoding_chunked(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
-        with set_http_connect(200, headers={'transfer-encoding': 'chunked'}):
+        with set_http_connect_contextmgr(
+                200,
+                headers={'transfer-encoding': 'chunked'}):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['Transfer-Encoding'], 'chunked')
 
     def _test_removes_swift_bytes(self, method):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method=method)
-        with set_http_connect(
-                200, headers={'content-type': 'image/jpeg; swift_bytes=99'}):
+        with set_http_connect_contextmgr(
+                200,
+                headers={'content-type': 'image/jpeg; swift_bytes=99'}):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['Content-Type'], 'image/jpeg')
@@ -1140,7 +1180,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
         req = swift.common.swob.Request.blank('/v1/a/c/o')
         self.app.logger.txn_id = req.environ['swift.trans_id'] = 'my-txn-id'
         stdout = BytesIO()
-        with set_http_connect(503, 200), \
+        with set_http_connect_contextmgr(503, 200), \
                 mock.patch('sys.stdout', stdout):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
@@ -1151,7 +1191,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
     def test_GET_handoff(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
         codes = [503] * self.obj_ring.replicas + [200]
-        with set_http_connect(*codes):
+        with set_http_connect_contextmgr(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
 
@@ -1159,7 +1199,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
         req = swift.common.swob.Request.blank('/v1/a/c/o')
         codes = [404] * (self.obj_ring.replicas +
                          self.obj_ring.max_more_nodes)
-        with set_http_connect(*codes):
+        with set_http_connect_contextmgr(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 404)
 
@@ -1175,7 +1215,8 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
             if method == 'PUT':
                 put_headers.append(headers)
         codes = [201] * self.obj_ring.replicas
-        with set_http_connect(*codes, give_connect=capture_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         give_connect=capture_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 201)
         for given_headers in put_headers:
@@ -1197,7 +1238,8 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
                 put_headers.append(headers)
         codes = [201] * self.obj_ring.replicas
         t = time.time()
-        with set_http_connect(*codes, give_connect=capture_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         give_connect=capture_headers):
             with mock.patch('time.time', lambda: t):
                 resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 201)
@@ -1220,7 +1262,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
                     'Content-Length': 0,
                     'X-Timestamp': put_timestamp})
             codes = [201] * self.obj_ring.replicas
-            with set_http_connect(*codes):
+            with set_http_connect_contextmgr(*codes):
                 resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 201)
 
@@ -1235,7 +1277,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
                     'X-Timestamp': put_timestamp})
             ts_iter = itertools.repeat(put_timestamp)
             codes = [409] * self.obj_ring.replicas
-            with set_http_connect(*codes, timestamps=ts_iter):
+            with set_http_connect_contextmgr(*codes, timestamps=ts_iter):
                 resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 202)
 
@@ -1250,7 +1292,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
                     'X-Timestamp': next(ts).internal})
             ts_iter = itertools.repeat(next(ts).internal)
             codes = [409] * self.obj_ring.replicas
-            with set_http_connect(*codes, timestamps=ts_iter):
+            with set_http_connect_contextmgr(*codes, timestamps=ts_iter):
                 resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 202)
 
@@ -1265,7 +1307,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
                     'X-Timestamp': next(ts).internal})
             ts_iter = itertools.repeat(orig_timestamp)
             codes = [201] * self.obj_ring.replicas
-            with set_http_connect(*codes, timestamps=ts_iter):
+            with set_http_connect_contextmgr(*codes, timestamps=ts_iter):
                 resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 201)
 
@@ -1277,7 +1319,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
                 'X-Timestamp': next(ts).internal})
         ts_iter = iter([next(ts).internal, None, None])
         codes = [409] + [201] * (self.obj_ring.replicas - 1)
-        with set_http_connect(*codes, timestamps=ts_iter):
+        with set_http_connect_contextmgr(*codes, timestamps=ts_iter):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 202)
 
@@ -1289,7 +1331,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
                 'X-Timestamp': next(ts).internal})
         ts_iter = iter([None, None, None])
         codes = [409] * self.obj_ring.replicas
-        with set_http_connect(*codes, timestamps=ts_iter):
+        with set_http_connect_contextmgr(*codes, timestamps=ts_iter):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 202)
 
@@ -1301,7 +1343,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
                 'X-Timestamp': next(ts).internal})
         ts_iter = iter([next(ts).internal, None, None])
         codes = [409] + [(201, 'notused')] * (self.obj_ring.replicas - 1)
-        with set_http_connect(*codes, timestamps=ts_iter):
+        with set_http_connect_contextmgr(*codes, timestamps=ts_iter):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 202)
 
@@ -1314,7 +1356,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
                 'X-Timestamp': next(ts).internal})
         ts_iter = iter([next(ts).internal, None, None])
         codes = [409] + [(412, 'notused')] * (self.obj_ring.replicas - 1)
-        with set_http_connect(*codes, timestamps=ts_iter):
+        with set_http_connect_contextmgr(*codes, timestamps=ts_iter):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 412)
 
@@ -1334,7 +1376,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
             codes = [409] * self.obj_ring.replicas
 
             ts_iter = iter(put_ts)
-            with set_http_connect(*codes, timestamps=ts_iter):
+            with set_http_connect_contextmgr(*codes, timestamps=ts_iter):
                 resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 202)
 
@@ -1356,7 +1398,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
 
             ts_iter = iter(put_ts)
             codes = put_resp
-            with set_http_connect(*codes, timestamps=ts_iter):
+            with set_http_connect_contextmgr(*codes, timestamps=ts_iter):
                 resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 202)
 
@@ -1370,7 +1412,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
         {'replicas': 1}, {'replicas': 5}, {'replicas': 8}, {'replicas': 15}])
 class TestReplicatedObjControllerVariousReplicas(BaseObjectControllerMixin,
                                                  unittest.TestCase):
-    controller_cls = obj.ReplicatedObjectController
+    controller_cls = ReplicatedObjectController
 
 
 class StubResponse(object):
@@ -1456,7 +1498,7 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         'storage_policy': '0',
     }
 
-    controller_cls = obj.ECObjectController
+    controller_cls = ECObjectController
 
     def _add_frag_index(self, index, headers):
         # helper method to add a frag index header to an existing header dict
@@ -1508,7 +1550,7 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
     def test_GET_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
         get_resp = [200] * self.policy.ec_ndata
-        with set_http_connect(*get_resp):
+        with set_http_connect_contextmgr(*get_resp):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertIn('Accept-Ranges', resp.headers)
@@ -1526,7 +1568,7 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             resp_headers = {'Etag': 'frag_etag',
                             'X-Object-Sysmeta-Ec-Etag': 'data_etag',
                             'X-Object-Sysmeta-Alternate-Etag': 'alt_etag'}
-            with set_http_connect(*get_resp, headers=resp_headers):
+            with set_http_connect_contextmgr(*get_resp, headers=resp_headers):
                 resp = req.get_response(self.app)
             self.assertEqual('data_etag', resp.headers['Etag'])
             return resp
@@ -1577,7 +1619,7 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             resp_headers = {'Etag': 'frag_etag',
                             'X-Object-Sysmeta-Ec-Etag': 'data_etag',
                             'X-Object-Sysmeta-Alternate-Etag': 'alt_etag'}
-            with set_http_connect(*get_resp, headers=resp_headers):
+            with set_http_connect_contextmgr(*get_resp, headers=resp_headers):
                 resp = req.get_response(self.app)
             self.assertEqual('data_etag', resp.headers['Etag'])
             return resp
@@ -1619,14 +1661,14 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         req = swift.common.swob.Request.blank('/v1/a/c/o',
                                               headers={'X-Newest': 'true'})
         codes = [200] * self.policy.ec_ndata
-        with set_http_connect(*codes):
+        with set_http_connect_contextmgr(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
 
     def test_GET_error(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
         get_resp = [503] + [200] * self.policy.ec_ndata
-        with set_http_connect(*get_resp):
+        with set_http_connect_contextmgr(*get_resp):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
 
@@ -1659,8 +1701,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         responses = [(200, ''.join(node_fragments[i]), headers)
                      for i in range(POLICIES.default.ec_ndata)]
         status_codes, body_iter, headers = zip(*responses)
-        with set_http_connect(*status_codes, body_iter=body_iter,
-                              headers=headers):
+        with set_http_connect_contextmgr(*status_codes, body_iter=body_iter,
+                                         headers=headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(len(real_body), len(resp.body))
@@ -1674,7 +1716,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 201)
 
@@ -1697,8 +1740,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         headers = {'Etag': 'bad etag'}
         req = swift.common.swob.Request.blank(
             '/v1/a/c/o', method='PUT', headers=headers, body=test_body)
-        with set_http_connect(*codes, expect_headers=expect_headers,
-                              give_expect=capture_expect):
+        with set_http_connect_contextmgr(*codes, expect_headers=expect_headers,
+                                         give_expect=capture_expect):
             resp = req.get_response(self.app)
         self.assertEqual(422, resp.status_int)
         self.assertEqual(self.replicas(), len(conns))
@@ -1710,7 +1753,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         env = {'swift.callback.update_footers': footers_callback}
         req = swift.common.swob.Request.blank(
             '/v1/a/c/o', method='PUT', environ=env, body=test_body)
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
         self.assertEqual(422, resp.status_int)
 
@@ -1724,7 +1768,7 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers), \
+        with set_http_connect_contextmgr(*codes, expect_headers=expect_headers), \
                 mock.patch('sys.stdout', stdout):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 503)
@@ -1741,7 +1785,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 201)
 
@@ -1753,7 +1798,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 503)
 
@@ -1767,7 +1813,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 201)
 
@@ -1779,7 +1826,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 503)
 
@@ -1794,7 +1842,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 201)
 
@@ -1808,7 +1857,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 503)
 
@@ -1821,7 +1871,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 201)
 
@@ -1834,7 +1885,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 201)
 
@@ -1853,7 +1905,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
 
         self.assertEqual(resp.status_int, 499)
@@ -1873,7 +1926,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
 
         self.assertEqual(resp.status_int, 408)
@@ -1893,7 +1947,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
 
         self.assertEqual(resp.status_int, 499)
@@ -1913,7 +1968,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
 
         self.assertEqual(resp.status_int, 500)
@@ -1956,10 +2012,12 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             put_requests[conn_id]['x-timestamp'] = headers[
                 'X-Timestamp']
 
-        with set_http_connect(*codes, expect_headers=expect_headers,
-                              give_send=capture_body,
-                              give_connect=capture_headers,
-                              headers=resp_headers):
+        with set_http_connect_contextmgr(
+                *codes,
+                expect_headers=expect_headers,
+                give_send=capture_body,
+                give_connect=capture_headers,
+                headers=resp_headers):
             resp = req.get_response(self.app)
 
         self.assertEqual(resp.status_int, 201)
@@ -2089,10 +2147,12 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             req = swift.common.swob.Request.blank(
                 '/v1/a/c/o', method='PUT', environ=env, body=test_body)
 
-            with set_http_connect(*codes, expect_headers=expect_headers,
-                                  give_send=capture_body,
-                                  give_connect=capture_headers,
-                                  headers=resp_headers):
+            with set_http_connect_contextmgr(
+                    *codes,
+                    expect_headers=expect_headers,
+                    give_send=capture_body,
+                    give_connect=capture_headers,
+                    headers=resp_headers):
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 201)
@@ -2200,7 +2260,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             # whoops, stupid random
             responses = responses[1:] + [responses[0]]
         codes, expect_headers = zip(*responses)
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 201)
 
@@ -2320,7 +2381,7 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
                 'X-Timestamp': obj_stub['timestamp'].normal,
                 'X-Backend-Data-Timestamp': obj_stub['timestamp'].internal,
                 'X-Backend-Fragments':
-                    server._make_backend_fragments_header(ts2frags)
+                    object_server._make_backend_fragments_header(ts2frags)
             }
             if durable_timestamp:
                 headers['X-Backend-Durable-Timestamp'] = durable_timestamp
@@ -3536,8 +3597,10 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         # sanity check responses1
         responses = responses1[:self.policy.ec_ndata]
         status_codes, body_iter, headers = zip(*responses)
-        with set_http_connect(*status_codes, body_iter=body_iter,
-                              headers=headers):
+        with set_http_connect_contextmgr(
+                *status_codes,
+                body_iter=body_iter,
+                headers=headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(md5(resp.body).hexdigest(), etag1)
@@ -3545,8 +3608,10 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         # sanity check responses2
         responses = responses2[:self.policy.ec_ndata]
         status_codes, body_iter, headers = zip(*responses)
-        with set_http_connect(*status_codes, body_iter=body_iter,
-                              headers=headers):
+        with set_http_connect_contextmgr(
+                *status_codes,
+                body_iter=body_iter,
+                headers=headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(md5(resp.body).hexdigest(), etag2)
@@ -3557,8 +3622,10 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         mixed_responses[mix_index] = responses2[mix_index]
 
         status_codes, body_iter, headers = zip(*mixed_responses)
-        with set_http_connect(*status_codes, body_iter=body_iter,
-                              headers=headers):
+        with set_http_connect_contextmgr(
+                *status_codes,
+                body_iter=body_iter,
+                headers=headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         try:
@@ -3591,8 +3658,10 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         status_codes, body_iter, headers = zip(*responses + [
             (404, '', {}) for i in range(
                 self.policy.object_ring.max_more_nodes)])
-        with set_http_connect(*status_codes, body_iter=body_iter,
-                              headers=headers):
+        with set_http_connect_contextmgr(
+                *status_codes,
+                body_iter=body_iter,
+                headers=headers):
             resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 200)
             # do this inside the fake http context manager, it'll try to
@@ -3624,8 +3693,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
 
         status_codes, body_iter, headers = zip(
             *responses[:self.policy.ec_ndata + 1])
-        with set_http_connect(*status_codes, body_iter=body_iter,
-                              headers=headers):
+        with set_http_connect_contextmgr(*status_codes, body_iter=body_iter,
+                                         headers=headers):
             resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 200)
             self.assertTrue(md5(resp.body).hexdigest(), etag)
@@ -3641,8 +3710,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         responses = [(200, '', headers)]
         status_codes, body_iter, headers = zip(*responses)
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='HEAD')
-        with set_http_connect(*status_codes, body_iter=body_iter,
-                              headers=headers):
+        with set_http_connect_contextmgr(*status_codes, body_iter=body_iter,
+                                         headers=headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.body, '')
@@ -3654,8 +3723,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         responses = [(404, '', {})] * self.replicas() * 2
         status_codes, body_iter, headers = zip(*responses)
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='HEAD')
-        with set_http_connect(*status_codes, body_iter=body_iter,
-                              headers=headers):
+        with set_http_connect_contextmgr(*status_codes, body_iter=body_iter,
+                                         headers=headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 404)
         # 404 shows actual response body size (i.e. 0 for HEAD)
@@ -3684,7 +3753,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             start = time.time()
             resp = req.get_response(self.app)
             response_time = time.time() - start
@@ -3703,7 +3773,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 201)
 
@@ -3719,7 +3790,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*codes, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(*codes,
+                                         expect_headers=expect_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 503)
 
@@ -3768,8 +3840,11 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             'X-Obj-Metadata-Footer': 'yes',
             'X-Obj-Multiphase-Commit': 'yes'
         }
-        with set_http_connect(*status_codes, body_iter=body_iter,
-                              headers=headers, expect_headers=expect_headers):
+        with set_http_connect_contextmgr(
+                *status_codes,
+                body_iter=body_iter,
+                headers=headers,
+                expect_headers=expect_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 416)
         self.assertEqual(resp.content_length, len(range_not_satisfiable_body))
@@ -3778,5 +3853,2135 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         self.assertEqual(resp.headers['Accept-Ranges'], 'bytes')
 
 
+@patch_policies([StoragePolicy(0, 'zero', True,
+                               object_ring=FakeRing(base_port=3000))])
+class TestObjectController(unittest.TestCase):
+
+    def setUp(self):
+        self.app = proxy_server.Application(
+            None, FakeMemcache(),
+            logger=debug_logger('proxy-ut'),
+            account_ring=FakeRing(),
+            container_ring=FakeRing())
+        # clear proxy logger result for each test
+        _test_servers[0].logger._clear()
+
+    def tearDown(self):
+        self.app.account_ring.set_replicas(3)
+        self.app.container_ring.set_replicas(3)
+        for policy in POLICIES:
+            policy.object_ring = FakeRing(base_port=3000)
+
+    def assert_status_map(self, method, statuses, expected, raise_exc=False):
+        with save_globals():
+            kwargs = {}
+            if raise_exc:
+                kwargs['raise_exc'] = raise_exc
+
+            set_http_connect(*statuses, **kwargs)
+            self.app.memcache.store = {}
+            req = Request.blank('/v1/a/c/o',
+                                headers={'Content-Length': '0',
+                                         'Content-Type': 'text/plain'})
+            self.app.update_request(req)
+            try:
+                res = method(req)
+            except HTTPException as res:
+                pass
+            self.assertEqual(res.status_int, expected)
+
+            # repeat test
+            set_http_connect(*statuses, **kwargs)
+            self.app.memcache.store = {}
+            req = Request.blank('/v1/a/c/o',
+                                headers={'Content-Length': '0',
+                                         'Content-Type': 'text/plain'})
+            self.app.update_request(req)
+            try:
+                res = method(req)
+            except HTTPException as res:
+                pass
+            self.assertEqual(res.status_int, expected)
+
+    def _sleep_enough(self, condition):
+        for sleeptime in (0.1, 1.0):
+            sleep(sleeptime)
+            if condition():
+                break
+
+    def test_PUT_expect_header_zero_content_length(self):
+        test_errors = []
+
+        def test_connect(ipaddr, port, device, partition, method, path,
+                         headers=None, query_string=None):
+            if path == '/a/c/o.jpg':
+                if 'expect' in headers or 'Expect' in headers:
+                    test_errors.append('Expect was in headers for object '
+                                       'server!')
+
+        with save_globals():
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            # The (201, Exception('test')) tuples in there have the effect of
+            # changing the status of the initial expect response.  The default
+            # expect response from FakeConn for 201 is 100.
+            # But the object server won't send a 100 continue line if the
+            # client doesn't send a expect 100 header (as is the case with
+            # zero byte PUTs as validated by this test), nevertheless the
+            # object controller calls getexpect without prejudice.  In this
+            # case the status from the response shows up early in getexpect
+            # instead of having to wait until getresponse.  The Exception is
+            # in there to ensure that the object controller also *uses* the
+            # result of getexpect instead of calling getresponse in which case
+            # our FakeConn will blow up.
+            success_codes = [(201, Exception('test'))] * 3
+            set_http_connect(200, 200, *success_codes,
+                             give_connect=test_connect)
+            req = Request.blank('/v1/a/c/o.jpg', {})
+            req.content_length = 0
+            self.app.update_request(req)
+            self.app.memcache.store = {}
+            res = controller.PUT(req)
+            self.assertEqual(test_errors, [])
+            self.assertTrue(res.status.startswith('201 '), res.status)
+
+    def test_PUT_expect_header_nonzero_content_length(self):
+        test_errors = []
+
+        def test_connect(ipaddr, port, device, partition, method, path,
+                         headers=None, query_string=None):
+            if path == '/a/c/o.jpg':
+                if 'Expect' not in headers:
+                    test_errors.append('Expect was not in headers for '
+                                       'non-zero byte PUT!')
+
+        with save_globals():
+            controller = ReplicatedObjectController(
+                self.app, 'a', 'c', 'o.jpg')
+            # the (100, 201) tuples in there are just being extra explicit
+            # about the FakeConn returning the 100 Continue status when the
+            # object controller calls getexpect.  Which is FakeConn's default
+            # for 201 if no expect_status is specified.
+            success_codes = [(100, 201)] * 3
+            set_http_connect(200, 200, *success_codes,
+                             give_connect=test_connect)
+            req = Request.blank('/v1/a/c/o.jpg', {})
+            req.content_length = 1
+            req.body = 'a'
+            self.app.update_request(req)
+            self.app.memcache.store = {}
+            res = controller.PUT(req)
+            self.assertEqual(test_errors, [])
+            self.assertTrue(res.status.startswith('201 '))
+
+    def test_PUT_respects_write_affinity(self):
+        written_to = []
+
+        def test_connect(ipaddr, port, device, partition, method, path,
+                         headers=None, query_string=None):
+            if path == '/a/c/o.jpg':
+                written_to.append((ipaddr, port, device))
+
+        with save_globals():
+            def is_r0(node):
+                return node['region'] == 0
+
+            object_ring = self.app.get_object_ring(None)
+            object_ring.max_more_nodes = 100
+            self.app.write_affinity_is_local_fn = is_r0
+            self.app.write_affinity_node_count = lambda r: 3
+
+            controller = \
+                ReplicatedObjectController(
+                    self.app, 'a', 'c', 'o.jpg')
+            set_http_connect(200, 200, 201, 201, 201,
+                             give_connect=test_connect)
+            req = Request.blank('/v1/a/c/o.jpg', {})
+            req.content_length = 1
+            req.body = 'a'
+            self.app.memcache.store = {}
+            res = controller.PUT(req)
+            self.assertTrue(res.status.startswith('201 '))
+
+        self.assertEqual(3, len(written_to))
+        for ip, port, device in written_to:
+            # this is kind of a hokey test, but in FakeRing, the port is even
+            # when the region is 0, and odd when the region is 1, so this test
+            # asserts that we only wrote to nodes in region 0.
+            self.assertEqual(0, port % 2)
+
+    def test_PUT_respects_write_affinity_with_507s(self):
+        written_to = []
+
+        def test_connect(ipaddr, port, device, partition, method, path,
+                         headers=None, query_string=None):
+            if path == '/a/c/o.jpg':
+                written_to.append((ipaddr, port, device))
+
+        with save_globals():
+            def is_r0(node):
+                return node['region'] == 0
+
+            object_ring = self.app.get_object_ring(None)
+            object_ring.max_more_nodes = 100
+            self.app.write_affinity_is_local_fn = is_r0
+            self.app.write_affinity_node_count = lambda r: 3
+
+            controller = \
+                ReplicatedObjectController(
+                    self.app, 'a', 'c', 'o.jpg')
+            self.app.error_limit(
+                object_ring.get_part_nodes(1)[0], 'test')
+            set_http_connect(200, 200,        # account, container
+                             201, 201, 201,   # 3 working backends
+                             give_connect=test_connect)
+            req = Request.blank('/v1/a/c/o.jpg', {})
+            req.content_length = 1
+            req.body = 'a'
+            self.app.memcache.store = {}
+            res = controller.PUT(req)
+            self.assertTrue(res.status.startswith('201 '))
+
+        self.assertEqual(3, len(written_to))
+        # this is kind of a hokey test, but in FakeRing, the port is even when
+        # the region is 0, and odd when the region is 1, so this test asserts
+        # that we wrote to 2 nodes in region 0, then went to 1 non-r0 node.
+        self.assertEqual(0, written_to[0][1] % 2)   # it's (ip, port, device)
+        self.assertEqual(0, written_to[1][1] % 2)
+        self.assertNotEqual(0, written_to[2][1] % 2)
+
+    def test_PUT_auto_content_type(self):
+        with save_globals():
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+
+            def test_content_type(filename, expected):
+                # The three responses here are for account_info() (HEAD to
+                # account server), container_info() (HEAD to container server)
+                # and three calls to _connect_put_node() (PUT to three object
+                # servers)
+                set_http_connect(201, 201, 201, 201, 201,
+                                 give_content_type=lambda content_type:
+                                 self.assertEqual(content_type,
+                                                  next(expected)))
+                # We need into include a transfer-encoding to get past
+                # constraints.check_object_creation()
+                req = Request.blank('/v1/a/c/%s' % filename, {},
+                                    headers={'transfer-encoding': 'chunked'})
+                self.app.update_request(req)
+                self.app.memcache.store = {}
+                res = controller.PUT(req)
+                # If we don't check the response here we could miss problems
+                # in PUT()
+                self.assertEqual(res.status_int, 201)
+
+            test_content_type('test.jpg', iter(['', '', 'image/jpeg',
+                                                'image/jpeg', 'image/jpeg']))
+            test_content_type('test.html', iter(['', '', 'text/html',
+                                                 'text/html', 'text/html']))
+            test_content_type('test.css', iter(['', '', 'text/css',
+                                                'text/css', 'text/css']))
+
+    def test_custom_mime_types_files(self):
+        swift_dir = mkdtemp()
+        try:
+            with open(os.path.join(swift_dir, 'mime.types'), 'w') as fp:
+                fp.write('foo/bar foo\n')
+            proxy_server.Application({'swift_dir': swift_dir},
+                                     FakeMemcache(), FakeLogger(),
+                                     FakeRing(), FakeRing())
+            self.assertEqual(proxy_server.mimetypes.guess_type('blah.foo')[0],
+                             'foo/bar')
+            self.assertEqual(proxy_server.mimetypes.guess_type('blah.jpg')[0],
+                             'image/jpeg')
+        finally:
+            rmtree(swift_dir, ignore_errors=True)
+
+    def test_PUT(self):
+        with save_globals():
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+
+            def test_status_map(statuses, expected):
+                set_http_connect(*statuses)
+                req = Request.blank('/v1/a/c/o.jpg', {})
+                req.content_length = 0
+                self.app.update_request(req)
+                self.app.memcache.store = {}
+                res = controller.PUT(req)
+                expected = str(expected)
+                self.assertEqual(res.status[:len(expected)], expected)
+            test_status_map((200, 200, 201, 201, 201), 201)
+            test_status_map((200, 200, 201, 201, 500), 201)
+            test_status_map((200, 200, 204, 404, 404), 404)
+            test_status_map((200, 200, 204, 500, 404), 503)
+            test_status_map((200, 200, 202, 202, 204), 204)
+
+    def test_PUT_connect_exceptions(self):
+        with save_globals():
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+
+            def test_status_map(statuses, expected):
+                set_http_connect(*statuses)
+                self.app.memcache.store = {}
+                req = Request.blank('/v1/a/c/o.jpg', {})
+                req.content_length = 0
+                self.app.update_request(req)
+                try:
+                    res = controller.PUT(req)
+                except HTTPException as res:
+                    pass
+                expected = str(expected)
+                self.assertEqual(res.status[:len(expected)], expected)
+            test_status_map((200, 200, 201, 201, -1), 201)  # connect exc
+            # connect errors
+            test_status_map((200, 200, Timeout(), 201, 201, ), 201)
+            test_status_map((200, 200, 201, 201, Exception()), 201)
+            # expect errors
+            test_status_map((200, 200, (Timeout(), None), 201, 201), 201)
+            test_status_map((200, 200, (Exception(), None), 201, 201), 201)
+            # response errors
+            test_status_map((200, 200, (100, Timeout()), 201, 201), 201)
+            test_status_map((200, 200, (100, Exception()), 201, 201), 201)
+            test_status_map((200, 200, 507, 201, 201), 201)  # error limited
+            test_status_map((200, 200, -1, 201, -1), 503)
+            test_status_map((200, 200, 503, -1, 503), 503)
+
+    def test_PUT_send_exceptions(self):
+        with save_globals():
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+
+            def test_status_map(statuses, expected):
+                self.app.memcache.store = {}
+                set_http_connect(*statuses)
+                req = Request.blank('/v1/a/c/o.jpg',
+                                    environ={'REQUEST_METHOD': 'PUT'},
+                                    body='some data')
+                self.app.update_request(req)
+                try:
+                    res = controller.PUT(req)
+                except HTTPException as res:
+                    pass
+                expected = str(expected)
+                self.assertEqual(res.status[:len(expected)], expected)
+            test_status_map((200, 200, 201, -1, 201), 201)
+            test_status_map((200, 200, 201, -1, -1), 503)
+            test_status_map((200, 200, 503, 503, -1), 503)
+
+    def test_PUT_max_size(self):
+        with save_globals():
+            set_http_connect(201, 201, 201)
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            req = Request.blank('/v1/a/c/o', {}, headers={
+                'Content-Length': str(constraints.MAX_FILE_SIZE + 1),
+                'Content-Type': 'foo/bar'})
+            self.app.update_request(req)
+            res = controller.PUT(req)
+            self.assertEqual(res.status_int, 413)
+
+    def test_PUT_bad_content_type(self):
+        with save_globals():
+            set_http_connect(201, 201, 201)
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            req = Request.blank('/v1/a/c/o', {}, headers={
+                'Content-Length': 0, 'Content-Type': 'foo/bar;swift_hey=45'})
+            self.app.update_request(req)
+            res = controller.PUT(req)
+            self.assertEqual(res.status_int, 400)
+
+    def test_PUT_getresponse_exceptions(self):
+
+        with save_globals():
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+
+            def test_status_map(statuses, expected):
+                self.app.memcache.store = {}
+                set_http_connect(*statuses)
+                req = Request.blank('/v1/a/c/o.jpg', {})
+                req.content_length = 0
+                self.app.update_request(req)
+                try:
+                    res = controller.PUT(req)
+                except HTTPException as res:
+                    pass
+                expected = str(expected)
+                self.assertEqual(res.status[:len(str(expected))],
+                                 str(expected))
+            test_status_map((200, 200, 201, 201, -1), 201)
+            test_status_map((200, 200, 201, -1, -1), 503)
+            test_status_map((200, 200, 503, 503, -1), 503)
+
+    def test_POST(self):
+        with save_globals():
+            self.app.object_post_as_copy = False
+
+            def test_status_map(statuses, expected):
+                set_http_connect(*statuses)
+                self.app.memcache.store = {}
+                req = Request.blank('/v1/a/c/o', {}, method='POST',
+                                    headers={'Content-Type': 'foo/bar'})
+                self.app.update_request(req)
+                res = req.get_response(self.app)
+                expected = str(expected)
+                self.assertEqual(res.status[:len(expected)], expected)
+            test_status_map((200, 200, 202, 202, 202), 202)
+            test_status_map((200, 200, 202, 202, 500), 202)
+            test_status_map((200, 200, 202, 500, 500), 503)
+            test_status_map((200, 200, 202, 404, 500), 503)
+            test_status_map((200, 200, 202, 404, 404), 404)
+            test_status_map((200, 200, 404, 500, 500), 503)
+            test_status_map((200, 200, 404, 404, 404), 404)
+
+    @patch_policies([
+        StoragePolicy(0, 'zero', is_default=True, object_ring=FakeRing()),
+        StoragePolicy(1, 'one', object_ring=FakeRing()),
+    ])
+    def test_POST_backend_headers(self):
+        # reset the router post patch_policies
+        self.app.obj_controller_router = proxy_server.ObjectControllerRouter()
+        self.app.object_post_as_copy = False
+        self.app.sort_nodes = lambda nodes: nodes
+        backend_requests = []
+
+        def capture_requests(ip, port, method, path, headers, *args,
+                             **kwargs):
+            backend_requests.append((method, path, headers))
+
+        req = Request.blank('/v1/a/c/o', {}, method='POST',
+                            headers={'X-Object-Meta-Color': 'Blue',
+                                     'Content-Type': 'text/plain'})
+
+        # we want the container_info response to says a policy index of 1
+        resp_headers = {'X-Backend-Storage-Policy-Index': 1}
+        with mocked_http_conn(
+                200, 200, 202, 202, 202,
+                headers=resp_headers, give_connect=capture_requests
+        ) as fake_conn:
+            resp = req.get_response(self.app)
+            self.assertRaises(StopIteration, fake_conn.code_iter.next)
+
+        self.assertEqual(resp.status_int, 202)
+        self.assertEqual(len(backend_requests), 5)
+
+        def check_request(req, method, path, headers=None):
+            req_method, req_path, req_headers = req
+            self.assertEqual(method, req_method)
+            # caller can ignore leading path parts
+            self.assertTrue(req_path.endswith(path),
+                            'expected path to end with %s, it was %s' % (
+                                path, req_path))
+            headers = headers or {}
+            # caller can ignore some headers
+            for k, v in headers.items():
+                self.assertEqual(req_headers[k], v)
+        account_request = backend_requests.pop(0)
+        check_request(account_request, method='HEAD', path='/sda/0/a')
+        container_request = backend_requests.pop(0)
+        check_request(container_request, method='HEAD', path='/sda/0/a/c')
+        # make sure backend requests included expected container headers
+        container_headers = {}
+        for request in backend_requests:
+            req_headers = request[2]
+            device = req_headers['x-container-device']
+            host = req_headers['x-container-host']
+            container_headers[device] = host
+            expectations = {
+                'method': 'POST',
+                'path': '/0/a/c/o',
+                'headers': {
+                    'X-Container-Partition': '0',
+                    'Connection': 'close',
+                    'User-Agent': 'proxy-server %s' % os.getpid(),
+                    'Host': 'localhost:80',
+                    'Referer': 'POST http://localhost/v1/a/c/o',
+                    'X-Object-Meta-Color': 'Blue',
+                    'X-Backend-Storage-Policy-Index': '1'
+                },
+            }
+            check_request(request, **expectations)
+
+        expected = {}
+        for i, device in enumerate(['sda', 'sdb', 'sdc']):
+            expected[device] = '10.0.0.%d:100%d' % (i, i)
+        self.assertEqual(container_headers, expected)
+
+        # and again with policy override
+        self.app.memcache.store = {}
+        backend_requests = []
+        req = Request.blank('/v1/a/c/o', {}, method='POST',
+                            headers={'X-Object-Meta-Color': 'Blue',
+                                     'Content-Type': 'text/plain',
+                                     'X-Backend-Storage-Policy-Index': 0})
+        with mocked_http_conn(
+                200, 200, 202, 202, 202,
+                headers=resp_headers, give_connect=capture_requests
+        ) as fake_conn:
+            resp = req.get_response(self.app)
+            self.assertRaises(StopIteration, fake_conn.code_iter.next)
+        self.assertEqual(resp.status_int, 202)
+        self.assertEqual(len(backend_requests), 5)
+        for request in backend_requests[2:]:
+            expectations = {
+                'method': 'POST',
+                'path': '/0/a/c/o',  # ignore device bit
+                'headers': {
+                    'X-Object-Meta-Color': 'Blue',
+                    'X-Backend-Storage-Policy-Index': '0',
+                }
+            }
+            check_request(request, **expectations)
+
+    def test_DELETE(self):
+        # import pdb; pdb.set_trace()
+        with save_globals():
+            def test_status_map(statuses, expected):
+                set_http_connect(*statuses)
+                self.app.memcache.store = {}
+                req = Request.blank('/v1/a/c/o', {'REQUEST_METHOD': 'DELETE'})
+                self.app.update_request(req)
+                res = req.get_response(self.app)
+                self.assertEqual(res.status[:len(str(expected))],
+                                 str(expected))
+            test_status_map((200, 200, 204, 204, 204), 204)
+            test_status_map((200, 200, 204, 204, 500), 204)
+            test_status_map((200, 200, 204, 404, 404), 404)
+            test_status_map((200, 204, 500, 500, 404), 503)
+            test_status_map((200, 200, 404, 404, 404), 404)
+            test_status_map((200, 200, 400, 400, 400), 400)
+
+    def test_HEAD(self):
+        with save_globals():
+            def test_status_map(statuses, expected):
+                set_http_connect(*statuses)
+                self.app.memcache.store = {}
+                req = Request.blank('/v1/a/c/o', {'REQUEST_METHOD': 'HEAD'})
+                self.app.update_request(req)
+                res = req.get_response(self.app)
+                self.assertEqual(res.status[:len(str(expected))],
+                                 str(expected))
+                if expected < 400:
+                    self.assertIn('x-works', res.headers)
+                    self.assertEqual(res.headers['x-works'], 'yes')
+                    self.assertIn('accept-ranges', res.headers)
+                    self.assertEqual(res.headers['accept-ranges'], 'bytes')
+
+            test_status_map((200, 200, 200, 404, 404), 200)
+            test_status_map((200, 200, 200, 500, 404), 200)
+            test_status_map((200, 200, 304, 500, 404), 304)
+            test_status_map((200, 200, 404, 404, 404), 404)
+            test_status_map((200, 200, 404, 404, 500), 404)
+            test_status_map((200, 200, 500, 500, 500), 503)
+
+    def test_HEAD_newest(self):
+        with save_globals():
+            def test_status_map(statuses, expected, timestamps,
+                                expected_timestamp):
+                set_http_connect(*statuses, timestamps=timestamps)
+                self.app.memcache.store = {}
+                req = Request.blank('/v1/a/c/o', {'REQUEST_METHOD': 'HEAD'},
+                                    headers={'x-newest': 'true'})
+                self.app.update_request(req)
+                res = req.get_response(self.app)
+                self.assertEqual(res.status[:len(str(expected))],
+                                 str(expected))
+                self.assertEqual(res.headers.get('last-modified'),
+                                 expected_timestamp)
+
+            #                acct cont obj  obj  obj
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '2', '3'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '3', '2'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '3', '1'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '3',
+                                                             '3', '1'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None,
+                                                             None, None), None)
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None,
+                                                             None, '1'), '1')
+            test_status_map((200, 200, 404, 404, 200), 200, ('0', '0', None,
+                                                             None, '1'), '1')
+
+    def test_GET_newest(self):
+        with save_globals():
+            def test_status_map(statuses, expected, timestamps,
+                                expected_timestamp):
+                set_http_connect(*statuses, timestamps=timestamps)
+                self.app.memcache.store = {}
+                req = Request.blank('/v1/a/c/o', {'REQUEST_METHOD': 'GET'},
+                                    headers={'x-newest': 'true'})
+                self.app.update_request(req)
+                res = req.get_response(self.app)
+                self.assertEqual(res.status[:len(str(expected))],
+                                 str(expected))
+                self.assertEqual(res.headers.get('last-modified'),
+                                 expected_timestamp)
+
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '2', '3'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '3', '2'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '3', '1'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '3',
+                                                             '3', '1'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None,
+                                                             None, None), None)
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None,
+                                                             None, '1'), '1')
+
+        with save_globals():
+            def test_status_map(statuses, expected, timestamps,
+                                expected_timestamp):
+                set_http_connect(*statuses, timestamps=timestamps)
+                self.app.memcache.store = {}
+                req = Request.blank('/v1/a/c/o', {'REQUEST_METHOD': 'HEAD'})
+                self.app.update_request(req)
+                res = req.get_response(self.app)
+                self.assertEqual(res.status[:len(str(expected))],
+                                 str(expected))
+                self.assertEqual(res.headers.get('last-modified'),
+                                 expected_timestamp)
+
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '2', '3'), '1')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '3', '2'), '1')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '3', '1'), '1')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '3',
+                                                             '3', '1'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None,
+                                                             '1', '2'), None)
+
+    def test_POST_meta_val_len(self):
+        with save_globals():
+            limit = constraints.MAX_META_VALUE_LENGTH
+            self.app.object_post_as_copy = False
+            ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            set_http_connect(200, 200, 202, 202, 202)
+            #             acct cont obj  obj  obj
+            req = Request.blank('/v1/a/c/o', {'REQUEST_METHOD': 'POST'},
+                                headers={'Content-Type': 'foo/bar',
+                                         'X-Object-Meta-Foo': 'x' * limit})
+            self.app.update_request(req)
+            res = req.get_response(self.app)
+            self.assertEqual(res.status_int, 202)
+            set_http_connect(202, 202, 202)
+            req = Request.blank(
+                '/v1/a/c/o', {'REQUEST_METHOD': 'POST'},
+                headers={'Content-Type': 'foo/bar',
+                         'X-Object-Meta-Foo': 'x' * (limit + 1)})
+            self.app.update_request(req)
+            res = req.get_response(self.app)
+            self.assertEqual(res.status_int, 400)
+
+    def test_POST_meta_authorize(self):
+        def authorize(req):
+            req.headers['X-Object-Meta-Foo'] = 'x' * (limit + 1)
+            return
+        with save_globals():
+            limit = constraints.MAX_META_VALUE_LENGTH
+            self.app.object_post_as_copy = False
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            set_http_connect(200, 200, 202, 202, 202)
+            #                acct cont obj  obj  obj
+            req = Request.blank('/v1/a/c/o', {'REQUEST_METHOD': 'POST'},
+                                headers={'Content-Type': 'foo/bar',
+                                         'X-Object-Meta-Foo': 'x'})
+            req.environ['swift.authorize'] = authorize
+            self.app.update_request(req)
+            res = controller.POST(req)
+            self.assertEqual(res.status_int, 400)
+
+    def test_POST_meta_key_len(self):
+        with save_globals():
+            limit = constraints.MAX_META_NAME_LENGTH
+            self.app.object_post_as_copy = False
+            set_http_connect(200, 200, 202, 202, 202)
+            #             acct cont obj  obj  obj
+            req = Request.blank(
+                '/v1/a/c/o', {'REQUEST_METHOD': 'POST'},
+                headers={'Content-Type': 'foo/bar',
+                         ('X-Object-Meta-' + 'x' * limit): 'x'})
+            self.app.update_request(req)
+            res = req.get_response(self.app)
+            self.assertEqual(res.status_int, 202)
+            set_http_connect(202, 202, 202)
+            req = Request.blank(
+                '/v1/a/c/o', {'REQUEST_METHOD': 'POST'},
+                headers={'Content-Type': 'foo/bar',
+                         ('X-Object-Meta-' + 'x' * (limit + 1)): 'x'})
+            self.app.update_request(req)
+            res = req.get_response(self.app)
+            self.assertEqual(res.status_int, 400)
+
+    def test_POST_meta_count(self):
+        with save_globals():
+            limit = constraints.MAX_META_COUNT
+            headers = dict(
+                (('X-Object-Meta-' + str(i), 'a') for i in range(limit + 1)))
+            headers.update({'Content-Type': 'foo/bar'})
+            set_http_connect(202, 202, 202)
+            req = Request.blank('/v1/a/c/o', {'REQUEST_METHOD': 'POST'},
+                                headers=headers)
+            self.app.update_request(req)
+            res = req.get_response(self.app)
+            self.assertEqual(res.status_int, 400)
+
+    def test_POST_meta_size(self):
+        with save_globals():
+            limit = constraints.MAX_META_OVERALL_SIZE
+            count = limit / 256  # enough to cause the limit to be reached
+            headers = dict(
+                (('X-Object-Meta-' + str(i), 'a' * 256)
+                    for i in range(count + 1)))
+            headers.update({'Content-Type': 'foo/bar'})
+            set_http_connect(202, 202, 202)
+            req = Request.blank('/v1/a/c/o', {'REQUEST_METHOD': 'POST'},
+                                headers=headers)
+            self.app.update_request(req)
+            res = req.get_response(self.app)
+            self.assertEqual(res.status_int, 400)
+
+    def test_PUT_not_autodetect_content_type(self):
+        with save_globals():
+            headers = {'Content-Type': 'something/right', 'Content-Length': 0}
+            it_worked = []
+
+            def verify_content_type(ipaddr, port, device, partition,
+                                    method, path, headers=None,
+                                    query_string=None):
+                if path == '/a/c/o.html':
+                    it_worked.append(
+                        headers['Content-Type'].startswith('something/right'))
+
+            set_http_connect(204, 204, 201, 201, 201,
+                             give_connect=verify_content_type)
+            req = Request.blank('/v1/a/c/o.html', {'REQUEST_METHOD': 'PUT'},
+                                headers=headers)
+            self.app.update_request(req)
+            req.get_response(self.app)
+            self.assertNotEqual(it_worked, [])
+            self.assertTrue(all(it_worked))
+
+    def test_PUT_autodetect_content_type(self):
+        with save_globals():
+            headers = {'Content-Type': 'something/wrong', 'Content-Length': 0,
+                       'X-Detect-Content-Type': 'True'}
+            it_worked = []
+
+            def verify_content_type(ipaddr, port, device, partition,
+                                    method, path, headers=None,
+                                    query_string=None):
+                if path == '/a/c/o.html':
+                    it_worked.append(
+                        headers['Content-Type'].startswith('text/html'))
+
+            set_http_connect(204, 204, 201, 201, 201,
+                             give_connect=verify_content_type)
+            req = Request.blank('/v1/a/c/o.html', {'REQUEST_METHOD': 'PUT'},
+                                headers=headers)
+            self.app.update_request(req)
+            req.get_response(self.app)
+            self.assertNotEqual(it_worked, [])
+            self.assertTrue(all(it_worked))
+
+    def test_client_timeout(self):
+        with save_globals():
+            self.app.account_ring.get_nodes('account')
+            for dev in self.app.account_ring.devs:
+                dev['ip'] = '127.0.0.1'
+                dev['port'] = 1
+            self.app.container_ring.get_nodes('account')
+            for dev in self.app.container_ring.devs:
+                dev['ip'] = '127.0.0.1'
+                dev['port'] = 1
+            object_ring = self.app.get_object_ring(None)
+            object_ring.get_nodes('account')
+            for dev in object_ring.devs:
+                dev['ip'] = '127.0.0.1'
+                dev['port'] = 1
+
+            class SlowBody(object):
+
+                def __init__(self):
+                    self.sent = 0
+
+                def read(self, size=-1):
+                    if self.sent < 4:
+                        sleep(0.1)
+                        self.sent += 1
+                        return ' '
+                    return ''
+
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'PUT',
+                                         'wsgi.input': SlowBody()},
+                                headers={'Content-Length': '4',
+                                         'Content-Type': 'text/plain'})
+            self.app.update_request(req)
+            set_http_connect(200, 200, 201, 201, 201)
+            #             acct cont obj  obj  obj
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 201)
+            self.app.client_timeout = 0.05
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'PUT',
+                                         'wsgi.input': SlowBody()},
+                                headers={'Content-Length': '4',
+                                         'Content-Type': 'text/plain'})
+            self.app.update_request(req)
+            set_http_connect(201, 201, 201)
+            #                obj  obj  obj
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 408)
+
+    def test_client_disconnect(self):
+        with save_globals():
+            self.app.account_ring.get_nodes('account')
+            for dev in self.app.account_ring.devs:
+                dev['ip'] = '127.0.0.1'
+                dev['port'] = 1
+            self.app.container_ring.get_nodes('account')
+            for dev in self.app.container_ring.devs:
+                dev['ip'] = '127.0.0.1'
+                dev['port'] = 1
+            object_ring = self.app.get_object_ring(None)
+            object_ring.get_nodes('account')
+            for dev in object_ring.devs:
+                dev['ip'] = '127.0.0.1'
+                dev['port'] = 1
+
+            class DisconnectedBody(object):
+
+                def __init__(self):
+                    self.sent = 0
+
+                def read(self, size=-1):
+                    return ''
+
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'PUT',
+                                         'wsgi.input': DisconnectedBody()},
+                                headers={'Content-Length': '4',
+                                         'Content-Type': 'text/plain'})
+            self.app.update_request(req)
+            set_http_connect(200, 200, 201, 201, 201)
+            #             acct cont obj  obj  obj
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 499)
+
+    def test_node_read_timeout(self):
+        with save_globals():
+            self.app.account_ring.get_nodes('account')
+            for dev in self.app.account_ring.devs:
+                dev['ip'] = '127.0.0.1'
+                dev['port'] = 1
+            self.app.container_ring.get_nodes('account')
+            for dev in self.app.container_ring.devs:
+                dev['ip'] = '127.0.0.1'
+                dev['port'] = 1
+            object_ring = self.app.get_object_ring(None)
+            object_ring.get_nodes('account')
+            for dev in object_ring.devs:
+                dev['ip'] = '127.0.0.1'
+                dev['port'] = 1
+            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+            self.app.update_request(req)
+            set_http_connect(200, 200, 200, slow=0.1)
+            req.sent_size = 0
+            resp = req.get_response(self.app)
+            got_exc = False
+            try:
+                resp.body
+            except ChunkReadTimeout:
+                got_exc = True
+            self.assertFalse(got_exc)
+            self.app.recoverable_node_timeout = 0.1
+            set_http_connect(200, 200, 200, slow=1.0)
+            resp = req.get_response(self.app)
+            got_exc = False
+            try:
+                resp.body
+            except ChunkReadTimeout:
+                got_exc = True
+            self.assertTrue(got_exc)
+
+    def test_node_read_timeout_retry(self):
+        with save_globals():
+            self.app.account_ring.get_nodes('account')
+            for dev in self.app.account_ring.devs:
+                dev['ip'] = '127.0.0.1'
+                dev['port'] = 1
+            self.app.container_ring.get_nodes('account')
+            for dev in self.app.container_ring.devs:
+                dev['ip'] = '127.0.0.1'
+                dev['port'] = 1
+            object_ring = self.app.get_object_ring(None)
+            object_ring.get_nodes('account')
+            for dev in object_ring.devs:
+                dev['ip'] = '127.0.0.1'
+                dev['port'] = 1
+            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+            self.app.update_request(req)
+
+            self.app.recoverable_node_timeout = 0.1
+            set_http_connect(200, 200, 200, slow=[1.0, 1.0, 1.0])
+            resp = req.get_response(self.app)
+            got_exc = False
+            try:
+                self.assertEqual('', resp.body)
+            except ChunkReadTimeout:
+                got_exc = True
+            self.assertTrue(got_exc)
+
+            set_http_connect(200, 200, 200, body='lalala',
+                             slow=[1.0, 1.0])
+            resp = req.get_response(self.app)
+            got_exc = False
+            try:
+                self.assertEqual(resp.body, 'lalala')
+            except ChunkReadTimeout:
+                got_exc = True
+            self.assertFalse(got_exc)
+
+            set_http_connect(200, 200, 200, body='lalala',
+                             slow=[1.0, 1.0], etags=['a', 'a', 'a'])
+            resp = req.get_response(self.app)
+            got_exc = False
+            try:
+                self.assertEqual(resp.body, 'lalala')
+            except ChunkReadTimeout:
+                got_exc = True
+            self.assertFalse(got_exc)
+
+            set_http_connect(200, 200, 200, body='lalala',
+                             slow=[1.0, 1.0], etags=['a', 'b', 'a'])
+            resp = req.get_response(self.app)
+            got_exc = False
+            try:
+                self.assertEqual(resp.body, 'lalala')
+            except ChunkReadTimeout:
+                got_exc = True
+            self.assertFalse(got_exc)
+
+            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+            set_http_connect(200, 200, 200, body='lalala',
+                             slow=[1.0, 1.0], etags=['a', 'b', 'b'])
+            resp = req.get_response(self.app)
+            got_exc = False
+            try:
+                resp.body
+            except ChunkReadTimeout:
+                got_exc = True
+            self.assertTrue(got_exc)
+
+    def test_node_write_timeout(self):
+        with save_globals():
+            self.app.account_ring.get_nodes('account')
+            for dev in self.app.account_ring.devs:
+                dev['ip'] = '127.0.0.1'
+                dev['port'] = 1
+            self.app.container_ring.get_nodes('account')
+            for dev in self.app.container_ring.devs:
+                dev['ip'] = '127.0.0.1'
+                dev['port'] = 1
+            object_ring = self.app.get_object_ring(None)
+            object_ring.get_nodes('account')
+            for dev in object_ring.devs:
+                dev['ip'] = '127.0.0.1'
+                dev['port'] = 1
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'PUT'},
+                                headers={'Content-Length': '4',
+                                         'Content-Type': 'text/plain'},
+                                body='    ')
+            self.app.update_request(req)
+            set_http_connect(200, 200, 201, 201, 201, slow=0.1)
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 201)
+            self.app.node_timeout = 0.1
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'PUT'},
+                                headers={'Content-Length': '4',
+                                         'Content-Type': 'text/plain'},
+                                body='    ')
+            self.app.update_request(req)
+            set_http_connect(201, 201, 201, slow=1.0)
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 503)
+
+    def test_node_request_setting(self):
+        baseapp = proxy_server.Application({'request_node_count': '3'},
+                                           FakeMemcache(),
+                                           container_ring=FakeRing(),
+                                           account_ring=FakeRing())
+        self.assertEqual(baseapp.request_node_count(3), 3)
+
+    def test_iter_nodes(self):
+        with save_globals():
+            try:
+                object_ring = self.app.get_object_ring(None)
+                object_ring.max_more_nodes = 2
+                partition, nodes = object_ring.get_nodes('account',
+                                                         'container',
+                                                         'object')
+                collected_nodes = []
+                for node in self.app.iter_nodes(object_ring,
+                                                partition):
+                    collected_nodes.append(node)
+                self.assertEqual(len(collected_nodes), 5)
+
+                object_ring.max_more_nodes = 6
+                self.app.request_node_count = lambda r: 20
+                partition, nodes = object_ring.get_nodes('account',
+                                                         'container',
+                                                         'object')
+                collected_nodes = []
+                for node in self.app.iter_nodes(object_ring,
+                                                partition):
+                    collected_nodes.append(node)
+                self.assertEqual(len(collected_nodes), 9)
+
+                # zero error-limited primary nodes -> no handoff warnings
+                self.app.log_handoffs = True
+                self.app.logger = FakeLogger()
+                self.app.request_node_count = lambda r: 7
+                object_ring.max_more_nodes = 20
+                partition, nodes = object_ring.get_nodes('account',
+                                                         'container',
+                                                         'object')
+                collected_nodes = []
+                for node in self.app.iter_nodes(object_ring, partition):
+                    collected_nodes.append(node)
+                self.assertEqual(len(collected_nodes), 7)
+                self.assertEqual(self.app.logger.log_dict['warning'], [])
+                self.assertEqual(self.app.logger.get_increments(), [])
+
+                # one error-limited primary node -> one handoff warning
+                self.app.log_handoffs = True
+                self.app.logger = FakeLogger()
+                self.app.request_node_count = lambda r: 7
+                self.app._error_limiting = {}  # clear out errors
+                set_node_errors(self.app, object_ring._devs[0], 999,
+                                last_error=(2 ** 63 - 1))
+
+                collected_nodes = []
+                for node in self.app.iter_nodes(object_ring, partition):
+                    collected_nodes.append(node)
+                self.assertEqual(len(collected_nodes), 7)
+                self.assertEqual(self.app.logger.log_dict['warning'], [
+                    (('Handoff requested (5)',), {})])
+                self.assertEqual(self.app.logger.get_increments(),
+                                 ['handoff_count'])
+
+                # two error-limited primary nodes -> two handoff warnings
+                self.app.log_handoffs = True
+                self.app.logger = FakeLogger()
+                self.app.request_node_count = lambda r: 7
+                self.app._error_limiting = {}  # clear out errors
+                for i in range(2):
+                    set_node_errors(self.app, object_ring._devs[i], 999,
+                                    last_error=(2 ** 63 - 1))
+
+                collected_nodes = []
+                for node in self.app.iter_nodes(object_ring, partition):
+                    collected_nodes.append(node)
+                self.assertEqual(len(collected_nodes), 7)
+                self.assertEqual(self.app.logger.log_dict['warning'], [
+                    (('Handoff requested (5)',), {}),
+                    (('Handoff requested (6)',), {})])
+                self.assertEqual(self.app.logger.get_increments(),
+                                 ['handoff_count',
+                                  'handoff_count'])
+
+                # all error-limited primary nodes -> four handoff warnings,
+                # plus a handoff-all metric
+                self.app.log_handoffs = True
+                self.app.logger = FakeLogger()
+                self.app.request_node_count = lambda r: 10
+                object_ring.set_replicas(4)  # otherwise we run out of handoffs
+                self.app._error_limiting = {}  # clear out errors
+                for i in range(4):
+                    set_node_errors(self.app, object_ring._devs[i], 999,
+                                    last_error=(2 ** 63 - 1))
+
+                collected_nodes = []
+                for node in self.app.iter_nodes(object_ring, partition):
+                    collected_nodes.append(node)
+                self.assertEqual(len(collected_nodes), 10)
+                self.assertEqual(self.app.logger.log_dict['warning'], [
+                    (('Handoff requested (7)',), {}),
+                    (('Handoff requested (8)',), {}),
+                    (('Handoff requested (9)',), {}),
+                    (('Handoff requested (10)',), {})])
+                self.assertEqual(self.app.logger.get_increments(),
+                                 ['handoff_count',
+                                  'handoff_count',
+                                  'handoff_count',
+                                  'handoff_count',
+                                  'handoff_all_count'])
+
+            finally:
+                object_ring.max_more_nodes = 0
+
+    def test_iter_nodes_calls_sort_nodes(self):
+        with mock.patch.object(self.app, 'sort_nodes') as sort_nodes:
+            object_ring = self.app.get_object_ring(None)
+            for node in self.app.iter_nodes(object_ring, 0):
+                pass
+            sort_nodes.assert_called_once_with(
+                object_ring.get_part_nodes(0))
+
+    def test_iter_nodes_skips_error_limited(self):
+        with mock.patch.object(self.app, 'sort_nodes', lambda n: n):
+            object_ring = self.app.get_object_ring(None)
+            first_nodes = list(self.app.iter_nodes(object_ring, 0))
+            second_nodes = list(self.app.iter_nodes(object_ring, 0))
+            self.assertIn(first_nodes[0], second_nodes)
+
+            self.app.error_limit(first_nodes[0], 'test')
+            second_nodes = list(self.app.iter_nodes(object_ring, 0))
+            self.assertNotIn(first_nodes[0], second_nodes)
+
+    def test_iter_nodes_gives_extra_if_error_limited_inline(self):
+        object_ring = self.app.get_object_ring(None)
+        with mock.patch.object(self.app, 'sort_nodes', lambda n: n), \
+                mock.patch.object(self.app, 'request_node_count',
+                                  lambda r: 6), \
+                mock.patch.object(object_ring, 'max_more_nodes', 99):
+            first_nodes = list(self.app.iter_nodes(object_ring, 0))
+            second_nodes = []
+            for node in self.app.iter_nodes(object_ring, 0):
+                if not second_nodes:
+                    self.app.error_limit(node, 'test')
+                second_nodes.append(node)
+            self.assertEqual(len(first_nodes), 6)
+            self.assertEqual(len(second_nodes), 7)
+
+    def test_iter_nodes_with_custom_node_iter(self):
+        object_ring = self.app.get_object_ring(None)
+        node_list = [dict(id=n, ip='1.2.3.4', port=n, device='D')
+                     for n in range(10)]
+        with mock.patch.object(self.app, 'sort_nodes', lambda n: n), \
+                mock.patch.object(self.app, 'request_node_count',
+                                  lambda r: 3):
+            got_nodes = list(self.app.iter_nodes(object_ring, 0,
+                                                 node_iter=iter(node_list)))
+        self.assertEqual(node_list[:3], got_nodes)
+
+        with mock.patch.object(self.app, 'sort_nodes', lambda n: n), \
+                mock.patch.object(self.app, 'request_node_count',
+                                  lambda r: 1000000):
+            got_nodes = list(self.app.iter_nodes(object_ring, 0,
+                                                 node_iter=iter(node_list)))
+        self.assertEqual(node_list, got_nodes)
+
+    def test_best_response_sets_headers(self):
+        controller = ReplicatedObjectController(
+            self.app, 'account', 'container', 'object')
+        req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+        resp = controller.best_response(req, [200] * 3, ['OK'] * 3, [''] * 3,
+                                        'Object', headers=[{'X-Test': '1'},
+                                                           {'X-Test': '2'},
+                                                           {'X-Test': '3'}])
+        self.assertEqual(resp.headers['X-Test'], '1')
+
+    def test_best_response_sets_etag(self):
+        controller = ReplicatedObjectController(
+            self.app, 'account', 'container', 'object')
+        req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+        resp = controller.best_response(req, [200] * 3, ['OK'] * 3, [''] * 3,
+                                        'Object')
+        self.assertIsNone(resp.etag)
+        resp = controller.best_response(req, [200] * 3, ['OK'] * 3, [''] * 3,
+                                        'Object',
+                                        etag='68b329da9893e34099c7d8ad5cb9c940'
+                                        )
+        self.assertEqual(resp.etag, '68b329da9893e34099c7d8ad5cb9c940')
+
+    def test_proxy_passes_content_type(self):
+        with save_globals():
+            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+            self.app.update_request(req)
+            set_http_connect(200, 200, 200)
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(resp.content_type, 'x-application/test')
+            set_http_connect(200, 200, 200)
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(resp.content_length, 0)
+            set_http_connect(200, 200, 200, slow=True)
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(resp.content_length, 4)
+
+    def test_proxy_passes_content_length_on_head(self):
+        with save_globals():
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'HEAD'})
+            self.app.update_request(req)
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            set_http_connect(200, 200, 200)
+            resp = controller.HEAD(req)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(resp.content_length, 0)
+            set_http_connect(200, 200, 200, slow=True)
+            resp = controller.HEAD(req)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(resp.content_length, 4)
+
+    def test_error_limiting(self):
+        with save_globals():
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            controller.app.sort_nodes = lambda l: l
+            object_ring = controller.app.get_object_ring(None)
+            self.assert_status_map(controller.HEAD, (200, 200, 503, 200, 200),
+                                   200)
+            self.assertEqual(
+                node_error_count(controller.app, object_ring.devs[0]), 2)
+            self.assertTrue(
+                node_last_error(controller.app, object_ring.devs[0])
+                is not None)
+            for _junk in range(self.app.error_suppression_limit):
+                self.assert_status_map(controller.HEAD, (200, 200, 503, 503,
+                                                         503), 503)
+            self.assertEqual(
+                node_error_count(controller.app, object_ring.devs[0]),
+                self.app.error_suppression_limit + 1)
+            self.assert_status_map(controller.HEAD, (200, 200, 200, 200, 200),
+                                   503)
+            self.assertTrue(
+                node_last_error(controller.app, object_ring.devs[0])
+                is not None)
+            self.assert_status_map(controller.PUT, (200, 200, 200, 201, 201,
+                                                    201), 503)
+            self.assert_status_map(controller.POST,
+                                   (200, 200, 200, 200, 200, 200, 202, 202,
+                                    202), 503)
+            self.assert_status_map(controller.DELETE,
+                                   (200, 200, 200, 204, 204, 204), 503)
+            self.app.error_suppression_interval = -300
+            self.assert_status_map(controller.HEAD, (200, 200, 200, 200, 200),
+                                   200)
+            self.assertRaises(BaseException,
+                              self.assert_status_map, controller.DELETE,
+                              (200, 200, 200, 204, 204, 204), 503,
+                              raise_exc=True)
+
+    def test_error_limiting_survives_ring_reload(self):
+        with save_globals():
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            controller.app.sort_nodes = lambda l: l
+            object_ring = controller.app.get_object_ring(None)
+            self.assert_status_map(controller.HEAD, (200, 200, 503, 200, 200),
+                                   200)
+            self.assertEqual(
+                node_error_count(controller.app, object_ring.devs[0]), 2)
+            self.assertTrue(
+                node_last_error(controller.app, object_ring.devs[0])
+                is not None)
+            for _junk in range(self.app.error_suppression_limit):
+                self.assert_status_map(controller.HEAD, (200, 200, 503, 503,
+                                                         503), 503)
+            self.assertEqual(
+                node_error_count(controller.app, object_ring.devs[0]),
+                self.app.error_suppression_limit + 1)
+
+            # wipe out any state in the ring
+            for policy in POLICIES:
+                policy.object_ring = FakeRing(base_port=3000)
+
+            # and we still get an error, which proves that the
+            # error-limiting info survived a ring reload
+            self.assert_status_map(controller.HEAD, (200, 200, 200, 200, 200),
+                                   503)
+
+    def test_PUT_error_limiting(self):
+        with save_globals():
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            controller.app.sort_nodes = lambda l: l
+            object_ring = controller.app.get_object_ring(None)
+            # acc con obj obj obj
+            self.assert_status_map(controller.PUT, (200, 200, 503, 200, 200),
+                                   200)
+
+            # 2, not 1, because assert_status_map() calls the method twice
+            odevs = object_ring.devs
+            self.assertEqual(node_error_count(controller.app, odevs[0]), 2)
+            self.assertEqual(node_error_count(controller.app, odevs[1]), 0)
+            self.assertEqual(node_error_count(controller.app, odevs[2]), 0)
+            self.assertTrue(
+                node_last_error(controller.app, odevs[0]) is not None)
+            self.assertTrue(node_last_error(controller.app, odevs[1]) is None)
+            self.assertTrue(node_last_error(controller.app, odevs[2]) is None)
+
+    def test_PUT_error_limiting_last_node(self):
+        with save_globals():
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            controller.app.sort_nodes = lambda l: l
+            object_ring = controller.app.get_object_ring(None)
+            # acc con obj obj obj
+            self.assert_status_map(controller.PUT, (200, 200, 200, 200, 503),
+                                   200)
+
+            # 2, not 1, because assert_status_map() calls the method twice
+            odevs = object_ring.devs
+            self.assertEqual(node_error_count(controller.app, odevs[0]), 0)
+            self.assertEqual(node_error_count(controller.app, odevs[1]), 0)
+            self.assertEqual(node_error_count(controller.app, odevs[2]), 2)
+            self.assertTrue(node_last_error(controller.app, odevs[0]) is None)
+            self.assertTrue(node_last_error(controller.app, odevs[1]) is None)
+            self.assertTrue(
+                node_last_error(controller.app, odevs[2]) is not None)
+
+    def test_acc_or_con_missing_returns_404(self):
+        with save_globals():
+            self.app.memcache = FakeMemcacheReturnsNone()
+            self.app._error_limiting = {}
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            set_http_connect(200, 200, 200, 200, 200, 200)
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'DELETE'})
+            self.app.update_request(req)
+            resp = getattr(controller, 'DELETE')(req)
+            self.assertEqual(resp.status_int, 200)
+
+            set_http_connect(404, 404, 404)
+            #             acct acct acct
+            # make sure to use a fresh request without cached env
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'DELETE'})
+            resp = getattr(controller, 'DELETE')(req)
+            self.assertEqual(resp.status_int, 404)
+
+            set_http_connect(503, 404, 404)
+            #             acct acct acct
+            # make sure to use a fresh request without cached env
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'DELETE'})
+            resp = getattr(controller, 'DELETE')(req)
+            self.assertEqual(resp.status_int, 404)
+
+            set_http_connect(503, 503, 404)
+            #             acct acct acct
+            # make sure to use a fresh request without cached env
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'DELETE'})
+            resp = getattr(controller, 'DELETE')(req)
+            self.assertEqual(resp.status_int, 404)
+
+            set_http_connect(503, 503, 503)
+            #            acct acct acct
+            # make sure to use a fresh request without cached env
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'DELETE'})
+            resp = getattr(controller, 'DELETE')(req)
+            self.assertEqual(resp.status_int, 404)
+
+            set_http_connect(200, 200, 204, 204, 204)
+            #             acct cont obj  obj  obj
+            # make sure to use a fresh request without cached env
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'DELETE'})
+            resp = getattr(controller, 'DELETE')(req)
+            self.assertEqual(resp.status_int, 204)
+
+            set_http_connect(200, 404, 404, 404)
+            #            acct cont cont cont
+            # make sure to use a fresh request without cached env
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'DELETE'})
+            resp = getattr(controller, 'DELETE')(req)
+            self.assertEqual(resp.status_int, 404)
+
+            set_http_connect(200, 503, 503, 503)
+            #             acct cont cont cont
+            # make sure to use a fresh request without cached env
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'DELETE'})
+            resp = getattr(controller, 'DELETE')(req)
+            self.assertEqual(resp.status_int, 404)
+
+            for dev in self.app.account_ring.devs:
+                set_node_errors(
+                    self.app, dev, self.app.error_suppression_limit + 1,
+                    time.time())
+            set_http_connect(200)
+            #            acct [isn't actually called since everything
+            #                  is error limited]
+            # make sure to use a fresh request without cached env
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'DELETE'})
+            resp = getattr(controller, 'DELETE')(req)
+            self.assertEqual(resp.status_int, 404)
+
+            for dev in self.app.account_ring.devs:
+                set_node_errors(self.app, dev, 0, last_error=None)
+            for dev in self.app.container_ring.devs:
+                set_node_errors(self.app, dev,
+                                self.app.error_suppression_limit + 1,
+                                time.time())
+            set_http_connect(200, 200)
+            #              acct cont [isn't actually called since
+            #                           everything is error limited]
+            # make sure to use a fresh request without cached env
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'DELETE'})
+            resp = getattr(controller, 'DELETE')(req)
+            self.assertEqual(resp.status_int, 404)
+
+    def test_PUT_POST_requires_container_exist(self):
+        with save_globals():
+            self.app.object_post_as_copy = False
+            self.app.memcache = FakeMemcacheReturnsNone()
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+
+            set_http_connect(200, 404, 404, 404, 200, 200, 200)
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'PUT'})
+            self.app.update_request(req)
+            resp = controller.PUT(req)
+            self.assertEqual(resp.status_int, 404)
+
+            set_http_connect(200, 404, 404, 404, 200, 200)
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'POST'},
+                                headers={'Content-Type': 'text/plain'})
+            self.app.update_request(req)
+            resp = controller.POST(req)
+            self.assertEqual(resp.status_int, 404)
+
+    def test_bad_metadata(self):
+        with save_globals():
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            set_http_connect(200, 200, 201, 201, 201)
+            #                acct cont obj  obj  obj
+            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                                headers={'Content-Length': '0'})
+            self.app.update_request(req)
+            resp = controller.PUT(req)
+            self.assertEqual(resp.status_int, 201)
+
+            set_http_connect(201, 201, 201)
+            req = Request.blank(
+                '/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                headers={'Content-Length': '0',
+                         'X-Object-Meta-' + (
+                             'a' * constraints.MAX_META_NAME_LENGTH): 'v'})
+            self.app.update_request(req)
+            resp = controller.PUT(req)
+            self.assertEqual(resp.status_int, 201)
+            set_http_connect(201, 201, 201)
+            req = Request.blank(
+                '/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                headers={
+                    'Content-Length': '0',
+                    'X-Object-Meta-' + (
+                        'a' * (constraints.MAX_META_NAME_LENGTH + 1)): 'v'})
+            self.app.update_request(req)
+            resp = controller.PUT(req)
+            self.assertEqual(resp.status_int, 400)
+
+            set_http_connect(201, 201, 201)
+            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                                headers={'Content-Length': '0',
+                                         'X-Object-Meta-Too-Long': 'a' *
+                                         constraints.MAX_META_VALUE_LENGTH})
+            self.app.update_request(req)
+            resp = controller.PUT(req)
+            self.assertEqual(resp.status_int, 201)
+            set_http_connect(201, 201, 201)
+            req = Request.blank(
+                '/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                headers={'Content-Length': '0',
+                         'X-Object-Meta-Too-Long': 'a' *
+                         (constraints.MAX_META_VALUE_LENGTH + 1)})
+            self.app.update_request(req)
+            resp = controller.PUT(req)
+            self.assertEqual(resp.status_int, 400)
+
+            set_http_connect(201, 201, 201)
+            headers = {'Content-Length': '0'}
+            for x in range(constraints.MAX_META_COUNT):
+                headers['X-Object-Meta-%d' % x] = 'v'
+            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                                headers=headers)
+            self.app.update_request(req)
+            resp = controller.PUT(req)
+            self.assertEqual(resp.status_int, 201)
+            set_http_connect(201, 201, 201)
+            headers = {'Content-Length': '0'}
+            for x in range(constraints.MAX_META_COUNT + 1):
+                headers['X-Object-Meta-%d' % x] = 'v'
+            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                                headers=headers)
+            self.app.update_request(req)
+            resp = controller.PUT(req)
+            self.assertEqual(resp.status_int, 400)
+
+            set_http_connect(201, 201, 201)
+            headers = {'Content-Length': '0'}
+            header_value = 'a' * constraints.MAX_META_VALUE_LENGTH
+            size = 0
+            x = 0
+            while size < constraints.MAX_META_OVERALL_SIZE - 4 - \
+                    constraints.MAX_META_VALUE_LENGTH:
+                size += 4 + constraints.MAX_META_VALUE_LENGTH
+                headers['X-Object-Meta-%04d' % x] = header_value
+                x += 1
+            if constraints.MAX_META_OVERALL_SIZE - size > 1:
+                headers['X-Object-Meta-a'] = \
+                    'a' * (constraints.MAX_META_OVERALL_SIZE - size - 1)
+            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                                headers=headers)
+            self.app.update_request(req)
+            resp = controller.PUT(req)
+            self.assertEqual(resp.status_int, 201)
+            set_http_connect(201, 201, 201)
+            headers['X-Object-Meta-a'] = \
+                'a' * (constraints.MAX_META_OVERALL_SIZE - size)
+            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                                headers=headers)
+            self.app.update_request(req)
+            resp = controller.PUT(req)
+            self.assertEqual(resp.status_int, 400)
+
+    @contextmanager
+    def controller_context(self, req, *args, **kwargs):
+        _v, account, container, obj = utils.split_path(req.path, 4, 4, True)
+        controller = ReplicatedObjectController(
+            self.app, account, container, obj)
+        self.app.update_request(req)
+        self.app.memcache.store = {}
+        with save_globals():
+            new_connect = set_http_connect(*args, **kwargs)
+            yield controller
+            unused_status_list = []
+            while True:
+                try:
+                    unused_status_list.append(next(new_connect.code_iter))
+                except StopIteration:
+                    break
+            if unused_status_list:
+                raise self.fail('UN-USED STATUS CODES: %r' %
+                                unused_status_list)
+
+    def test_mismatched_etags(self):
+        with save_globals():
+            # no etag supplied, object servers return success w/ diff values
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                                headers={'Content-Length': '0'})
+            self.app.update_request(req)
+            set_http_connect(200, 201, 201, 201,
+                             etags=[None,
+                                    '68b329da9893e34099c7d8ad5cb9c940',
+                                    '68b329da9893e34099c7d8ad5cb9c940',
+                                    '68b329da9893e34099c7d8ad5cb9c941'])
+            resp = controller.PUT(req)
+            self.assertEqual(resp.status_int // 100, 5)  # server error
+
+            # req supplies etag, object servers return 422 - mismatch
+            headers = {'Content-Length': '0',
+                       'ETag': '68b329da9893e34099c7d8ad5cb9c940'}
+            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                                headers=headers)
+            self.app.update_request(req)
+            set_http_connect(200, 422, 422, 503,
+                             etags=['68b329da9893e34099c7d8ad5cb9c940',
+                                    '68b329da9893e34099c7d8ad5cb9c941',
+                                    None,
+                                    None])
+            resp = controller.PUT(req)
+            self.assertEqual(resp.status_int // 100, 4)  # client error
+
+    def test_response_get_accept_ranges_header(self):
+        with save_globals():
+            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+            self.app.update_request(req)
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            set_http_connect(200, 200, 200)
+            resp = controller.GET(req)
+            self.assertIn('accept-ranges', resp.headers)
+            self.assertEqual(resp.headers['accept-ranges'], 'bytes')
+
+    def test_response_head_accept_ranges_header(self):
+        with save_globals():
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'HEAD'})
+            self.app.update_request(req)
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            set_http_connect(200, 200, 200)
+            resp = controller.HEAD(req)
+            self.assertIn('accept-ranges', resp.headers)
+            self.assertEqual(resp.headers['accept-ranges'], 'bytes')
+
+    def test_GET_calls_authorize(self):
+        called = [False]
+
+        def authorize(req):
+            called[0] = True
+            return HTTPUnauthorized(request=req)
+        with save_globals():
+            set_http_connect(200, 200, 201, 201, 201)
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            req = Request.blank('/v1/a/c/o')
+            req.environ['swift.authorize'] = authorize
+            self.app.update_request(req)
+            controller.GET(req)
+        self.assertTrue(called[0])
+
+    def test_HEAD_calls_authorize(self):
+        called = [False]
+
+        def authorize(req):
+            called[0] = True
+            return HTTPUnauthorized(request=req)
+        with save_globals():
+            set_http_connect(200, 200, 201, 201, 201)
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            req = Request.blank('/v1/a/c/o', {'REQUEST_METHOD': 'HEAD'})
+            req.environ['swift.authorize'] = authorize
+            self.app.update_request(req)
+            controller.HEAD(req)
+        self.assertTrue(called[0])
+
+    def test_POST_calls_authorize(self):
+        called = [False]
+
+        def authorize(req):
+            called[0] = True
+            return HTTPUnauthorized(request=req)
+        with save_globals():
+            self.app.object_post_as_copy = False
+            set_http_connect(200, 200, 201, 201, 201)
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            req = Request.blank('/v1/a/c/o',
+                                environ={'REQUEST_METHOD': 'POST'},
+                                headers={'Content-Length': '5'}, body='12345')
+            req.environ['swift.authorize'] = authorize
+            self.app.update_request(req)
+            controller.POST(req)
+        self.assertTrue(called[0])
+
+    def test_PUT_calls_authorize(self):
+        called = [False]
+
+        def authorize(req):
+            called[0] = True
+            return HTTPUnauthorized(request=req)
+        with save_globals():
+            set_http_connect(200, 200, 201, 201, 201)
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                                headers={'Content-Length': '5'}, body='12345')
+            req.environ['swift.authorize'] = authorize
+            self.app.update_request(req)
+            controller.PUT(req)
+        self.assertTrue(called[0])
+
+    def test_POST_converts_delete_after_to_delete_at(self):
+        with save_globals():
+            self.app.object_post_as_copy = False
+            controller = ReplicatedObjectController(
+                self.app, 'account', 'container', 'object')
+            set_http_connect(200, 200, 202, 202, 202)
+            self.app.memcache.store = {}
+            orig_time = time.time
+            try:
+                t = time.time()
+                time.time = lambda: t
+                req = Request.blank('/v1/a/c/o', {},
+                                    headers={'Content-Type': 'foo/bar',
+                                             'X-Delete-After': '60'})
+                self.app.update_request(req)
+                res = controller.POST(req)
+                self.assertEqual(res.status, '202 Fake')
+                self.assertEqual(req.headers.get('x-delete-at'),
+                                 str(int(t + 60)))
+            finally:
+                time.time = orig_time
+
+    def test_OPTIONS(self):
+        with save_globals():
+            controller = ReplicatedObjectController(
+                self.app, 'a', 'c', 'o.jpg')
+
+            def my_empty_container_info(*args):
+                return {}
+            controller.container_info = my_empty_container_info
+            req = Request.blank(
+                '/v1/a/c/o.jpg',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'http://foo.com',
+                         'Access-Control-Request-Method': 'GET'})
+            resp = controller.OPTIONS(req)
+            self.assertEqual(401, resp.status_int)
+
+            def my_empty_origin_container_info(*args):
+                return {'cors': {'allow_origin': None}}
+            controller.container_info = my_empty_origin_container_info
+            req = Request.blank(
+                '/v1/a/c/o.jpg',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'http://foo.com',
+                         'Access-Control-Request-Method': 'GET'})
+            resp = controller.OPTIONS(req)
+            self.assertEqual(401, resp.status_int)
+
+            def my_container_info(*args):
+                return {
+                    'cors': {
+                        'allow_origin': 'http://foo.bar:8080 https://foo.bar',
+                        'max_age': '999',
+                    }
+                }
+            controller.container_info = my_container_info
+            req = Request.blank(
+                '/v1/a/c/o.jpg',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'https://foo.bar',
+                         'Access-Control-Request-Method': 'GET'})
+            req.content_length = 0
+            resp = controller.OPTIONS(req)
+            self.assertEqual(200, resp.status_int)
+            self.assertEqual(
+                'https://foo.bar',
+                resp.headers['access-control-allow-origin'])
+            for verb in 'OPTIONS GET POST PUT DELETE HEAD'.split():
+                self.assertIn(verb,
+                              resp.headers['access-control-allow-methods'])
+            self.assertEqual(
+                len(resp.headers['access-control-allow-methods'].split(', ')),
+                6)
+            self.assertEqual('999', resp.headers['access-control-max-age'])
+            req = Request.blank(
+                '/v1/a/c/o.jpg',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'https://foo.bar'})
+            req.content_length = 0
+            resp = controller.OPTIONS(req)
+            self.assertEqual(401, resp.status_int)
+            req = Request.blank('/v1/a/c/o.jpg', {'REQUEST_METHOD': 'OPTIONS'})
+            req.content_length = 0
+            resp = controller.OPTIONS(req)
+            self.assertEqual(200, resp.status_int)
+            for verb in 'OPTIONS GET POST PUT DELETE HEAD'.split():
+                self.assertIn(verb, resp.headers['Allow'])
+            self.assertEqual(len(resp.headers['Allow'].split(', ')), 6)
+            req = Request.blank(
+                '/v1/a/c/o.jpg',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'http://foo.com'})
+            resp = controller.OPTIONS(req)
+            self.assertEqual(401, resp.status_int)
+            req = Request.blank(
+                '/v1/a/c/o.jpg',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'http://foo.bar',
+                         'Access-Control-Request-Method': 'GET'})
+            controller.app.cors_allow_origin = ['http://foo.bar', ]
+            resp = controller.OPTIONS(req)
+            self.assertEqual(200, resp.status_int)
+
+            def my_container_info_wildcard(*args):
+                return {
+                    'cors': {
+                        'allow_origin': '*',
+                        'max_age': '999',
+                    }
+                }
+            controller.container_info = my_container_info_wildcard
+            req = Request.blank(
+                '/v1/a/c/o.jpg',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'https://bar.baz',
+                         'Access-Control-Request-Method': 'GET'})
+            req.content_length = 0
+            resp = controller.OPTIONS(req)
+            self.assertEqual(200, resp.status_int)
+            self.assertEqual('*', resp.headers['access-control-allow-origin'])
+            for verb in 'OPTIONS GET POST PUT DELETE HEAD'.split():
+                self.assertIn(verb,
+                              resp.headers['access-control-allow-methods'])
+            self.assertEqual(
+                len(resp.headers['access-control-allow-methods'].split(', ')),
+                6)
+            self.assertEqual('999', resp.headers['access-control-max-age'])
+
+    def _get_CORS_response(self, container_cors, strict_mode, object_get=None):
+        with save_globals():
+            controller = ReplicatedObjectController(
+                self.app, 'a', 'c', 'o')
+
+            def stubContainerInfo(*args):
+                return {
+                    'cors': container_cors
+                }
+
+            controller.container_info = stubContainerInfo
+            controller.app.strict_cors_mode = strict_mode
+
+            def objectGET(controller, req):
+                return Response(headers={
+                    'X-Object-Meta-Color': 'red',
+                    'X-Super-Secret': 'hush',
+                })
+
+            mock_object_get = object_get or objectGET
+
+            req = Request.blank(
+                '/v1/a/c/o.jpg',
+                {'REQUEST_METHOD': 'GET'},
+                headers={'Origin': 'http://foo.bar'})
+
+            resp = cors_validation(mock_object_get)(controller, req)
+
+            return resp
+
+    def test_CORS_valid_non_strict(self):
+        # test expose_headers to non-allowed origins
+        container_cors = {'allow_origin': 'http://not.foo.bar',
+                          'expose_headers': 'X-Object-Meta-Color '
+                                            'X-Object-Meta-Color-Ex'}
+        resp = self._get_CORS_response(
+            container_cors=container_cors, strict_mode=False)
+
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('http://foo.bar',
+                         resp.headers['access-control-allow-origin'])
+        self.assertEqual('red', resp.headers['x-object-meta-color'])
+        # X-Super-Secret is in the response, but not "exposed"
+        self.assertEqual('hush', resp.headers['x-super-secret'])
+        self.assertIn('access-control-expose-headers', resp.headers)
+        exposed = set(
+            h.strip() for h in
+            resp.headers['access-control-expose-headers'].split(','))
+        expected_exposed = set([
+            'cache-control', 'content-language', 'content-type', 'expires',
+            'last-modified', 'pragma', 'etag', 'x-timestamp', 'x-trans-id',
+            'x-openstack-request-id', 'x-object-meta-color',
+            'x-object-meta-color-ex'])
+        self.assertEqual(expected_exposed, exposed)
+
+        # test allow_origin *
+        container_cors = {'allow_origin': '*'}
+
+        resp = self._get_CORS_response(
+            container_cors=container_cors, strict_mode=False)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('*',
+                         resp.headers['access-control-allow-origin'])
+
+        # test allow_origin empty
+        container_cors = {'allow_origin': ''}
+        resp = self._get_CORS_response(
+            container_cors=container_cors, strict_mode=False)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('http://foo.bar',
+                         resp.headers['access-control-allow-origin'])
+
+    def test_CORS_valid_strict(self):
+        # test expose_headers to non-allowed origins
+        container_cors = {'allow_origin': 'http://not.foo.bar',
+                          'expose_headers': 'X-Object-Meta-Color '
+                                            'X-Object-Meta-Color-Ex'}
+        resp = self._get_CORS_response(
+            container_cors=container_cors, strict_mode=True)
+
+        self.assertEqual(200, resp.status_int)
+        self.assertNotIn('access-control-expose-headers', resp.headers)
+        self.assertNotIn('access-control-allow-origin', resp.headers)
+
+        # test allow_origin *
+        container_cors = {'allow_origin': '*'}
+
+        resp = self._get_CORS_response(
+            container_cors=container_cors, strict_mode=True)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('*',
+                         resp.headers['access-control-allow-origin'])
+        self.assertEqual('red', resp.headers['x-object-meta-color'])
+        # X-Super-Secret is in the response, but not "exposed"
+        self.assertEqual('hush', resp.headers['x-super-secret'])
+        self.assertIn('access-control-expose-headers', resp.headers)
+        exposed = set(
+            h.strip() for h in
+            resp.headers['access-control-expose-headers'].split(','))
+        expected_exposed = set([
+            'cache-control', 'content-language', 'content-type', 'expires',
+            'last-modified', 'pragma', 'etag', 'x-timestamp', 'x-trans-id',
+            'x-openstack-request-id', 'x-object-meta-color'])
+        self.assertEqual(expected_exposed, exposed)
+
+        # test allow_origin empty
+        container_cors = {'allow_origin': ''}
+        resp = self._get_CORS_response(
+            container_cors=container_cors, strict_mode=True)
+        self.assertNotIn('access-control-expose-headers', resp.headers)
+        self.assertNotIn('access-control-allow-origin', resp.headers)
+
+    def test_CORS_valid_with_obj_headers(self):
+        container_cors = {'allow_origin': 'http://foo.bar'}
+
+        def objectGET(controller, req):
+            return Response(headers={
+                'X-Object-Meta-Color': 'red',
+                'X-Super-Secret': 'hush',
+                'Access-Control-Allow-Origin': 'http://obj.origin',
+                'Access-Control-Expose-Headers': 'x-trans-id'
+            })
+
+        resp = self._get_CORS_response(
+            container_cors=container_cors, strict_mode=True,
+            object_get=objectGET)
+
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('http://obj.origin',
+                         resp.headers['access-control-allow-origin'])
+        self.assertEqual('x-trans-id',
+                         resp.headers['access-control-expose-headers'])
+
+    def _gather_x_container_headers(self, controller_call, req, *connect_args,
+                                    **kwargs):
+        header_list = kwargs.pop('header_list', ['X-Container-Device',
+                                                 'X-Container-Host',
+                                                 'X-Container-Partition'])
+        seen_headers = []
+
+        def capture_headers(ipaddr, port, device, partition, method,
+                            path, headers=None, query_string=None):
+            captured = {}
+            for header in header_list:
+                captured[header] = headers.get(header)
+            seen_headers.append(captured)
+
+        with save_globals():
+            self.app.allow_account_management = True
+
+            set_http_connect(*connect_args, give_connect=capture_headers,
+                             **kwargs)
+            resp = controller_call(req)
+            self.assertEqual(2, resp.status_int // 100)  # sanity check
+
+            # don't care about the account/container HEADs, so chuck
+            # the first two requests
+            return sorted(seen_headers[2:],
+                          key=lambda d: d.get(header_list[0]) or 'z')
+
+    def test_PUT_x_container_headers_with_equal_replicas(self):
+        req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'Content-Length': '5'}, body='12345')
+        controller = ReplicatedObjectController(
+            self.app, 'a', 'c', 'o')
+        seen_headers = self._gather_x_container_headers(
+            controller.PUT, req,
+            200, 200, 201, 201, 201)   # HEAD HEAD PUT PUT PUT
+        self.assertEqual(
+            seen_headers, [
+                {'X-Container-Host': '10.0.0.0:1000',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sda'},
+                {'X-Container-Host': '10.0.0.1:1001',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sdb'},
+                {'X-Container-Host': '10.0.0.2:1002',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sdc'}])
+
+    def test_PUT_x_container_headers_with_fewer_container_replicas(self):
+        self.app.container_ring.set_replicas(2)
+
+        req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'Content-Length': '5'}, body='12345')
+        controller = ReplicatedObjectController(
+            self.app, 'a', 'c', 'o')
+        seen_headers = self._gather_x_container_headers(
+            controller.PUT, req,
+            200, 200, 201, 201, 201)   # HEAD HEAD PUT PUT PUT
+
+        self.assertEqual(
+            seen_headers, [
+                {'X-Container-Host': '10.0.0.0:1000',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sda'},
+                {'X-Container-Host': '10.0.0.0:1000',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sda'},
+                {'X-Container-Host': '10.0.0.1:1001',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sdb'}])
+
+    def test_PUT_x_container_headers_with_more_container_replicas(self):
+        self.app.container_ring.set_replicas(4)
+
+        req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'Content-Length': '5'}, body='12345')
+        controller = ReplicatedObjectController(
+            self.app, 'a', 'c', 'o')
+        seen_headers = self._gather_x_container_headers(
+            controller.PUT, req,
+            200, 200, 201, 201, 201)   # HEAD HEAD PUT PUT PUT
+
+        self.assertEqual(
+            seen_headers, [
+                {'X-Container-Host': '10.0.0.0:1000,10.0.0.3:1003',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sda,sdd'},
+                {'X-Container-Host': '10.0.0.1:1001',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sdb'},
+                {'X-Container-Host': '10.0.0.2:1002',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sdc'}])
+
+    def test_POST_x_container_headers_with_more_container_replicas(self):
+        self.app.container_ring.set_replicas(4)
+        self.app.object_post_as_copy = False
+
+        req = Request.blank('/v1/a/c/o',
+                            environ={'REQUEST_METHOD': 'POST'},
+                            headers={'Content-Type': 'application/stuff'})
+        controller = ReplicatedObjectController(
+            self.app, 'a', 'c', 'o')
+        seen_headers = self._gather_x_container_headers(
+            controller.POST, req,
+            200, 200, 200, 200, 200)   # HEAD HEAD POST POST POST
+
+        self.assertEqual(
+            seen_headers, [
+                {'X-Container-Host': '10.0.0.0:1000,10.0.0.3:1003',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sda,sdd'},
+                {'X-Container-Host': '10.0.0.1:1001',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sdb'},
+                {'X-Container-Host': '10.0.0.2:1002',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sdc'}])
+
+    def test_DELETE_x_container_headers_with_more_container_replicas(self):
+        self.app.container_ring.set_replicas(4)
+
+        req = Request.blank('/v1/a/c/o',
+                            environ={'REQUEST_METHOD': 'DELETE'},
+                            headers={'Content-Type': 'application/stuff'})
+        controller = ReplicatedObjectController(
+            self.app, 'a', 'c', 'o')
+        seen_headers = self._gather_x_container_headers(
+            controller.DELETE, req,
+            200, 200, 200, 200, 200)   # HEAD HEAD DELETE DELETE DELETE
+
+        self.assertEqual(seen_headers, [
+            {'X-Container-Host': '10.0.0.0:1000,10.0.0.3:1003',
+             'X-Container-Partition': '0',
+             'X-Container-Device': 'sda,sdd'},
+            {'X-Container-Host': '10.0.0.1:1001',
+             'X-Container-Partition': '0',
+             'X-Container-Device': 'sdb'},
+            {'X-Container-Host': '10.0.0.2:1002',
+             'X-Container-Partition': '0',
+             'X-Container-Device': 'sdc'}
+        ])
+
+    @mock.patch('time.time', new=lambda: STATIC_TIME)
+    def test_PUT_x_delete_at_with_fewer_container_replicas(self):
+        self.app.container_ring.set_replicas(2)
+
+        delete_at_timestamp = int(time.time()) + 100000
+        delete_at_container = utils.get_expirer_container(
+            delete_at_timestamp, self.app.expiring_objects_container_divisor,
+            'a', 'c', 'o')
+        req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'Content-Type': 'application/stuff',
+                                     'Content-Length': '0',
+                                     'X-Delete-At': str(delete_at_timestamp)})
+        controller = ReplicatedObjectController(
+            self.app, 'a', 'c', 'o')
+        seen_headers = self._gather_x_container_headers(
+            controller.PUT, req,
+            200, 200, 201, 201, 201,   # HEAD HEAD PUT PUT PUT
+            header_list=('X-Delete-At-Host', 'X-Delete-At-Device',
+                         'X-Delete-At-Partition', 'X-Delete-At-Container'))
+
+        self.assertEqual(seen_headers, [
+            {'X-Delete-At-Host': '10.0.0.0:1000',
+             'X-Delete-At-Container': delete_at_container,
+             'X-Delete-At-Partition': '0',
+             'X-Delete-At-Device': 'sda'},
+            {'X-Delete-At-Host': '10.0.0.1:1001',
+             'X-Delete-At-Container': delete_at_container,
+             'X-Delete-At-Partition': '0',
+             'X-Delete-At-Device': 'sdb'},
+            {'X-Delete-At-Host': None,
+             'X-Delete-At-Container': None,
+             'X-Delete-At-Partition': None,
+             'X-Delete-At-Device': None}
+        ])
+
+    @mock.patch('time.time', new=lambda: STATIC_TIME)
+    def test_PUT_x_delete_at_with_more_container_replicas(self):
+        self.app.container_ring.set_replicas(4)
+        self.app.expiring_objects_account = 'expires'
+        self.app.expiring_objects_container_divisor = 60
+
+        delete_at_timestamp = int(time.time()) + 100000
+        delete_at_container = utils.get_expirer_container(
+            delete_at_timestamp, self.app.expiring_objects_container_divisor,
+            'a', 'c', 'o')
+        req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'Content-Type': 'application/stuff',
+                                     'Content-Length': 0,
+                                     'X-Delete-At': str(delete_at_timestamp)})
+        controller = ReplicatedObjectController(
+            self.app, 'a', 'c', 'o')
+        seen_headers = self._gather_x_container_headers(
+            controller.PUT, req,
+            200, 200, 201, 201, 201,   # HEAD HEAD PUT PUT PUT
+            header_list=('X-Delete-At-Host', 'X-Delete-At-Device',
+                         'X-Delete-At-Partition', 'X-Delete-At-Container'))
+        self.assertEqual(seen_headers, [
+            {'X-Delete-At-Host': '10.0.0.0:1000,10.0.0.3:1003',
+             'X-Delete-At-Container': delete_at_container,
+             'X-Delete-At-Partition': '0',
+             'X-Delete-At-Device': 'sda,sdd'},
+            {'X-Delete-At-Host': '10.0.0.1:1001',
+             'X-Delete-At-Container': delete_at_container,
+             'X-Delete-At-Partition': '0',
+             'X-Delete-At-Device': 'sdb'},
+            {'X-Delete-At-Host': '10.0.0.2:1002',
+             'X-Delete-At-Container': delete_at_container,
+             'X-Delete-At-Partition': '0',
+             'X-Delete-At-Device': 'sdc'}
+        ])
+
+
 if __name__ == '__main__':
+    setup()
     unittest.main()
